@@ -70,6 +70,22 @@ pub struct RelationProductMeta {
     pub write_positions: Vec<usize>,
 }
 
+/// One event (transition group) used by [`LDDFunction::saturate`].
+///
+/// See [`LDDFunction::relation_product_meta`] for how to compute `relation` and a full `meta`;
+/// `meta_at_top` must be `meta` descended `top` times (e.g. via repeated [`LDDFunction::node`]), so
+/// that its own root describes state-vector position `top`.
+pub struct SaturationEvent {
+    /// The event's transition relation (short-vector encoding).
+    pub relation: LDDFunction,
+    /// The event's relation-product meta, descended `top` times.
+    pub meta_at_top: LDDFunction,
+    /// First (topmost) state-vector position this event reads or writes.
+    pub top: u32,
+    /// Last (bottommost) state-vector position this event reads or writes.
+    pub bot: u32,
+}
+
 /// Generates the inherent methods of the public `LDDFunction` wrapper by
 /// delegating to the inner [`oxidd_rules_ldd::LDDFunction`].
 ///
@@ -369,6 +385,59 @@ macro_rules! ldd_function_methods {
                     <<Self as Function>::Manager<'_> as Manager>::InnerNode::new(0, [t, e], value),
                 )?;
                 Ok(Self::from_edge(manager, edge))
+            }
+
+            /// Returns `N*(self)`, the smallest superset of `self` closed under every event in
+            /// `events`, computed by node-wise saturation.
+            /// 
+            /// > Ciardo, Marmorstein, Siminiceanu, *The saturation algorithm for symbolic state-space exploration*, STTT 2006.
+            ///
+            /// `self` must contain vectors of length `num_levels`. Results are memoised on node
+            /// identity and `epoch`: the caller must pass a fresh, never-before-used `epoch` — or
+            /// call [`clear_apply_cache`][Self::clear_apply_cache] and keep reusing the same one —
+            /// whenever any event's relation has changed since the previous `saturate` call on this
+            /// manager. Skipping this is the single most likely way to get a silently wrong result:
+            /// a node cached as saturated under an older, smaller relation would otherwise be reused
+            /// as if it still were.
+            pub fn saturate(
+                &self,
+                events: &[$crate::ldd::SaturationEvent],
+                num_levels: u32,
+                epoch: u32,
+            ) -> ::oxidd_core::util::AllocResult<Self> {
+                use ::oxidd_core::Manager;
+                use ::oxidd_core::ManagerRef;
+                use ::oxidd_core::function::Function;
+                self.manager_ref().with_manager_shared(|manager| {
+                    let owned_events: Vec<_> = events
+                        .iter()
+                        .map(|event| ::oxidd_rules_ldd::SaturationEvent {
+                            relation: manager.clone_edge(event.relation.as_edge(manager)),
+                            meta_at_top: manager.clone_edge(event.meta_at_top.as_edge(manager)),
+                            top: event.top,
+                            bot: event.bot,
+                        })
+                        .collect();
+
+                    let set = manager.clone_edge(self.as_edge(manager));
+                    let result =
+                        FunctionInner::saturate_edge(manager, set, &owned_events, num_levels, epoch);
+
+                    for event in owned_events {
+                        manager.drop_edge(event.relation);
+                        manager.drop_edge(event.meta_at_top);
+                    }
+
+                    Ok(Self(FunctionInner::from_edge(manager, result?)))
+                })
+            }
+
+            /// Clears the apply cache. An alternative to bumping `epoch` between two
+            /// [`saturate`][Self::saturate] calls whose events have changed.
+            pub fn clear_apply_cache(
+                manager: &<Self as ::oxidd_core::function::Function>::Manager<'_>,
+            ) {
+                FunctionInner::clear_apply_cache(manager);
             }
 
             /// Returns a stable identifier for the root node of `self`, suitable
