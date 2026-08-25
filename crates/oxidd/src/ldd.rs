@@ -402,7 +402,7 @@ mod index {
         terminals: 2,
     });
 
-    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 5);
+    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 6);
 
     crate::util::manager_ref_index_based!(pub struct LDDManagerRef(<LDD as DD>::ManagerRef) with LDDManagerData);
 
@@ -443,7 +443,7 @@ mod pointer {
         tag_bits: 2,
     });
 
-    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 5);
+    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 6);
 
     crate::util::manager_ref_pointer_based!(pub struct LDDManagerRef(<LDD as DD>::ManagerRef) with LDDManagerData);
 
