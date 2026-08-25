@@ -1,12 +1,13 @@
 //! List decision diagrams (LDDs) for OxiDD.
 
-use std::{collections::HashMap, hash::Hash};
+use std::collections::HashMap;
+use std::hash::Hash;
 
 use oxidd_core::{
     function::{EdgeOfFunc, Function},
     util::{AllocResult, Borrowed, EdgeDropGuard},
-    DiagramRules, Edge, HasApplyCache, HasLevel, InnerNode, LevelNo, Manager, ManagerRef,
-    ReducedOrNew,
+    ApplyCache, DiagramRules, Edge, HasApplyCache, HasLevel, InnerNode, LevelNo, Manager,
+    ManagerRef, ReducedOrNew,
 };
 use oxidd_derive::{Countable, Function};
 
@@ -15,6 +16,7 @@ use crate::recursor::SequentialRecursor;
 
 mod apply;
 mod recursor;
+mod saturate;
 
 #[cfg(feature = "statistics")]
 pub use apply::print_stats;
@@ -46,6 +48,13 @@ pub enum LDDOp {
     Intersect,
 
     Minus,
+
+    /// Node-wise saturation (`Sat_p`, see [`crate::saturate`]).
+    Saturate,
+
+    /// The recursive, node-saturating half of one event's firing below its `top` level (see
+    /// [`crate::saturate`]).
+    SatRecFire,
 }
 
 /// For LDDs it is essential that values are ordered and can be cloned.
@@ -131,6 +140,23 @@ pub struct RelationProductMeta<E> {
     pub read_positions: Vec<usize>,
     /// The positions of the write variables in the meta encoding.
     pub write_positions: Vec<usize>,
+}
+
+/// One event (transition group) used by [`LDDFunction::saturate_edge`].
+///
+/// `relation` and `meta_at_top` are as produced by [`LDDFunction::relation_product_meta`], except
+/// `meta_at_top` must already be descended `top` times, so that its own root describes state
+/// position `top` — the meta-LDD is otherwise padded with `false_value` entries for every position
+/// below the actual bottom, which [`crate::saturate`] never needs to see.
+pub struct SaturationEvent<E> {
+    /// The event's transition relation (short-vector encoding).
+    pub relation: E,
+    /// The event's relation-product meta, descended `top` times.
+    pub meta_at_top: E,
+    /// First (topmost) state-vector position this event reads or writes.
+    pub top: u32,
+    /// Last (bottommost) state-vector position this event reads or writes.
+    pub bot: u32,
 }
 
 /// Boolean function backed by a list decision diagram
@@ -429,6 +455,34 @@ where
                 .get_node(self.as_edge(manager))
                 .is_terminal(&LDDTerminal::Empty)
         })
+    }
+
+    /// Returns `N*(set)`, the smallest superset of `set` closed under every event in `events`,
+    /// computed by node-wise saturation (see [`crate::saturate`]) rather than whole-set fixpoint
+    /// iteration.
+    ///
+    /// `set` must contain vectors of length `num_levels`. Results are memoised on node identity and
+    /// `epoch` under `LDDOp::Saturate` / `LDDOp::SatRecFire` (see the module-level note on `epoch`
+    /// in [`crate::saturate`]): the caller must pass a fresh `epoch` — or call
+    /// [`clear_apply_cache`][Self::clear_apply_cache] and keep reusing the same one — whenever any
+    /// event's relation has changed since the previous call.
+    #[inline]
+    pub fn saturate_edge<'id>(
+        manager: &<LDDFunction<F> as Function>::Manager<'id>,
+        set: EdgeOfFunc<'id, Self>,
+        events: &[SaturationEvent<EdgeOfFunc<'id, Self>>],
+        num_levels: u32,
+        epoch: u32,
+    ) -> AllocResult<EdgeOfFunc<'id, Self>> {
+        let set = EdgeDropGuard::new(manager, set);
+        crate::saturate::saturate(manager, set.borrowed(), 0, events, num_levels, epoch)
+    }
+
+    /// Clears the apply cache. An alternative to bumping `epoch` between two
+    /// [`saturate_edge`][Self::saturate_edge] calls whose events have changed.
+    #[inline]
+    pub fn clear_apply_cache<'id>(manager: &<LDDFunction<F> as Function>::Manager<'id>) {
+        manager.apply_cache().clear(manager);
     }
 }
 
@@ -743,6 +797,29 @@ pub mod mt {
                     .is_terminal(&LDDTerminal::Empty)
             })
         }
+
+        /// See [`LDDFunction::saturate_edge`].
+        ///
+        /// Saturation is not yet parallelised (its node-local fixpoint is inherently sequential in
+        /// its accumulator): this dispatches to the same sequential implementation regardless of
+        /// the manager's worker pool.
+        #[inline]
+        pub fn saturate_edge<'id>(
+            manager: &<Self as Function>::Manager<'id>,
+            set: EdgeOfFunc<'id, Self>,
+            events: &[SaturationEvent<EdgeOfFunc<'id, Self>>],
+            num_levels: u32,
+            epoch: u32,
+        ) -> AllocResult<EdgeOfFunc<'id, Self>> {
+            let set = EdgeDropGuard::new(manager, set);
+            crate::saturate::saturate(manager, set.borrowed(), 0, events, num_levels, epoch)
+        }
+
+        /// See [`LDDFunction::clear_apply_cache`].
+        #[inline]
+        pub fn clear_apply_cache<'id>(manager: &<Self as Function>::Manager<'id>) {
+            manager.apply_cache().clear(manager);
+        }
     }
 }
 
@@ -780,28 +857,28 @@ macro_rules! stat {
     (call $op:expr) => {
         let _ = $op as usize;
         #[cfg(feature = "statistics")]
-        STAT_COUNTERS[$op as usize]
+        crate::apply::STAT_COUNTERS[$op as usize]
             .calls
             .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
     };
     (cache_query $op:expr) => {
         let _ = $op as usize;
         #[cfg(feature = "statistics")]
-        STAT_COUNTERS[$op as usize]
+        crate::apply::STAT_COUNTERS[$op as usize]
             .cache_queries
             .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
     };
     (cache_hit $op:expr) => {
         let _ = $op as usize;
         #[cfg(feature = "statistics")]
-        STAT_COUNTERS[$op as usize]
+        crate::apply::STAT_COUNTERS[$op as usize]
             .cache_hits
             .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
     };
     (reduced $op:expr) => {
         let _ = $op as usize;
         #[cfg(feature = "statistics")]
-        STAT_COUNTERS[$op as usize]
+        crate::apply::STAT_COUNTERS[$op as usize]
             .reduced
             .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
     };
