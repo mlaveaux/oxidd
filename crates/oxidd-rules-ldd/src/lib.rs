@@ -461,11 +461,9 @@ where
     /// computed by node-wise saturation (see [`crate::saturate`]) rather than whole-set fixpoint
     /// iteration.
     ///
-    /// `set` must contain vectors of length `num_levels`. Results are memoised on node identity and
-    /// `epoch` under `LDDOp::Saturate` / `LDDOp::SatRecFire` (see the module-level note on `epoch`
-    /// in [`crate::saturate`]): the caller must pass a fresh `epoch` — or call
-    /// [`clear_apply_cache`][Self::clear_apply_cache] and keep reusing the same one — whenever any
-    /// event's relation has changed since the previous call.
+    /// `set` must contain vectors of length `num_levels`. The `epoch` parameter is used to
+    /// distinguish different saturation runs and should be incremented or changed whenever the
+    /// events have changed since the previous call.
     #[inline]
     pub fn saturate_edge<'id>(
         manager: &<LDDFunction<F> as Function>::Manager<'id>,
