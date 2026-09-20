@@ -1,45 +1,19 @@
-//! Node-wise MDD/LDD saturation (Ciardo, Marmorstein, Siminiceanu, *The
-//! saturation algorithm for symbolic state-space exploration*, STTT 2006).
+//! Node-wise MDD/LDD saturation as described in 
+//! 
+//! > Ciardo, Marmorstein, Siminiceanu. *The saturation algorithm for symbolic
+//! > state-space exploration*, STTT 2006.
 //!
-//! Unlike the whole-set fixpoint operators in [`crate::apply`], saturation
-//! never applies an event to a whole frontier. It brings one node at a time
-//! to a fixed point under every event confined to its own level and below,
-//! bottom-up, before that node is ever used as anyone's child — so a node is
-//! only ever built once, in its final form, instead of accumulating
-//! intermediate breadth-first versions.
-//!
-//! `oxidd`'s LDD manager is immutable and hash-consed (no in-place node
-//! mutation, unlike the SMART implementation the paper describes), so the
-//! "in-place" node-local fixpoint is instead simulated with an ordinary Rust
-//! `BTreeMap` accumulator that is committed once, immutably, via
-//! [`make_node`]. This preserves the complexity benefits of saturation (event
-//! locality, bottom-up reuse of already-saturated subgraphs via the apply
-//! cache) at the cost of a constant-factor allocation overhead for nodes that
-//! are still converging.
+//! The main idea of saturation is bringing one node at a time to a fixed point
+//! under every event confined to its own level and below, bottom-up, before
+//! that node is ever used as anyone's child. So a node is only ever built once,
+//! in its final form, instead of accumulating intermediate breadth-first
+//! versions.
 //!
 //! Positions in the state vector run `0` (top) to `num_levels - 1` (bottom),
-//! matching this crate's own numbering (which is the *reverse* of the
-//! paper's `Top`/`Bot`, which count `K..1` top-down). Because every LDD node
-//! actually resides on manager level `0` (see [`crate::LDDRules`]), a node's
-//! position is *not* recoverable from the manager — it is threaded through
-//! every call as an explicit parameter instead.
-//!
-//! # `epoch`
-//!
-//! `saturate`'s meaning depends on the whole `events` slice, which is not
-//! content-addressed by any of the edges in the cache key: on-the-fly
-//! relation learning grows an event's relation mid-run, and two different
-//! explorations may share one manager. Every `Saturate`/`SatRecFire` cache
-//! entry therefore carries an extra numeric `epoch` operand. The caller must
-//! use a fresh `epoch` (or call
-//! [`LDDFunction::clear_apply_cache`][crate::LDDFunction::clear_apply_cache])
-//! whenever any event's relation changes — otherwise a node cached as
-//! saturated under an older, smaller relation would be reused as if it still
-//! were, which is silently wrong rather than a crash.
+//! which is the reverse of the paper.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, VecDeque};
 
 use oxidd_core::util::{AllocResult, Borrowed, EdgeDropGuard};
 use oxidd_core::{ApplyCache, Edge, InnerNode, Node};
@@ -49,13 +23,9 @@ use crate::recursor::SequentialRecursor;
 use crate::stat;
 use crate::{LDDManager, LDDOp, LDDTerminal, LDDValue, SaturationEvent};
 
-/// Returns `N*(q)`, the smallest superset of the vectors denoted by `q` that
-/// is closed under every event in `events` whose `top` is `>= p` (`Sat_p(q)`
-/// in the paper's terms), where `q` is known to sit at state-vector position
-/// `p`.
-///
-/// Memoised on node identity and `epoch` via `LDDOp::Saturate` — see the
-/// module-level note on `epoch`.
+/// Returns `N*(q)`, the smallest superset of the vectors denoted by `q` that is
+/// closed under every event in `events` whose `top` is `>= p`, where `q` is
+/// known to sit at state-vector position `p`.
 pub(crate) fn saturate<M: LDDManager>(
     manager: &M,
     q: Borrowed<M::Edge>,
@@ -67,8 +37,7 @@ pub(crate) fn saturate<M: LDDManager>(
     stat!(call LDDOp::Saturate);
     debug_assert!(p <= num_levels);
 
-    // Terminals (the empty set and the empty vector) are trivial fixed
-    // points of every event.
+    // Terminals are trivial fixed points of every event.
     if let Node::Terminal(_) = manager.get_node(&q) {
         return Ok(manager.clone_edge(&q));
     }
@@ -83,98 +52,80 @@ pub(crate) fn saturate<M: LDDManager>(
         return Ok(res);
     }
 
-    // (1) Bottom-up: saturate every child first, so the accumulator starts
-    // out `Sat_{p+1}`-closed. Walked with owned clones per step (rather than
-    // holding a borrow across the recursive `saturate` calls below) so nested
-    // saturation of siblings cannot conflict with holding `q`'s own node
-    // borrowed.
-    let mut arcs: BTreeMap<M::InnerNodeValue, M::Edge> = BTreeMap::new();
-    {
-        let mut cur = EdgeDropGuard::new(manager, manager.clone_edge(&q));
-        loop {
-            let (value, down, right, right_is_empty) = {
-                let node = match manager.get_node(&cur) {
-                    Node::Inner(n) => n.borrow(),
-                    Node::Terminal(_) => unreachable!("q's right spine ends at the Empty terminal"),
-                };
-                let value = node.get_value().clone();
-                let (down, right) = collect_children(node);
-                let right_is_empty = manager.get_node(&right).is_terminal(&LDDTerminal::Empty);
-                (
-                    value,
-                    manager.clone_edge(&down),
-                    manager.clone_edge(&right),
-                    right_is_empty,
-                )
-            };
-
-            let down_guard = EdgeDropGuard::new(manager, down);
-            let down_sat = saturate(manager, down_guard.borrowed(), p + 1, events, num_levels, epoch)?;
-            arcs.insert(value, down_sat);
-
-            if right_is_empty {
-                manager.drop_edge(right);
-                break;
-            }
-            cur = EdgeDropGuard::new(manager, right);
-        }
-    }
-
-    // (2) Node-local fixpoint over the events confined to this level
-    // (`top(e) == p`): fire every such event out of every local value,
-    // unioning the result into the accumulator and re-queuing any value the
-    // union actually changed (the paper's pipelining).
-    let mut work: VecDeque<M::InnerNodeValue> = arcs.keys().cloned().collect();
-    while let Some(i) = work.pop_front() {
-        let arc_i = match arcs.get(&i) {
-            Some(e) => manager.clone_edge(e),
-            None => continue,
+    // (1) Right to left: saturate the tail of the spine first, so it is already closed under the
+    // events at this level, and then put the head value in front of it. The head can only ever add
+    // to the tail (events may also write values smaller than the head, so this must be a union
+    // rather than a `make_node`), which means no intermediate accumulator is needed: every
+    // intermediate result is an ordinary, immutable node.
+    let (value, down, right) = {
+        let node = match manager.get_node(&q) {
+            Node::Inner(n) => n.borrow(),
+            Node::Terminal(_) => unreachable!("terminals are handled above"),
         };
-        let arc_i_guard = EdgeDropGuard::new(manager, arc_i);
+        let value = node.get_value().clone();
+        let (down, right) = collect_children(node);
+        (value, manager.clone_edge(&down), manager.clone_edge(&right))
+    };
+    let down_guard = EdgeDropGuard::new(manager, down);
+    let right_guard = EdgeDropGuard::new(manager, right);
 
-        for event in events.iter().filter(|e| e.top == p) {
-            let fired = sat_fire_top(manager, event, &i, arc_i_guard.borrowed(), events, num_levels, epoch)?;
-            for (j, f) in fired {
-                let f_guard = EdgeDropGuard::new(manager, f);
+    let right_sat = EdgeDropGuard::new(
+        manager,
+        saturate(manager, right_guard.borrowed(), p, events, num_levels, epoch)?,
+    );
+    let down_sat = saturate(manager, down_guard.borrowed(), p + 1, events, num_levels, epoch)?;
+    let head = EdgeDropGuard::new(
+        manager,
+        make_node(manager, &value, down_sat, manager.get_terminal(LDDTerminal::Empty)?)?,
+    );
+    let mut node = EdgeDropGuard::new(
+        manager,
+        apply_union(manager, SequentialRecursor, head.borrowed(), right_sat.borrowed())?,
+    );
 
-                let existing = match arcs.get(&j) {
-                    Some(e) => manager.clone_edge(e),
-                    None => manager.get_terminal(LDDTerminal::Empty)?,
-                };
-                let existing_guard = EdgeDropGuard::new(manager, existing);
+    // (2) Fixpoint over the events confined to this level (`top(e) == p`): fire every such event
+    // out of the values on the frontier and union the result into the node. Only the head can
+    // have anything new to fire initially, since the tail is closed already. Afterwards only the
+    // values whose continuation actually changed need to fire again (the paper's pipelining).
+    let mut frontier = vec![value];
+    while !frontier.is_empty() {
+        let mut fired = Vec::new();
+        for i in frontier.drain(..) {
+            let Some(arc_i) = spine_lookup(manager, node.borrowed(), &i) else {
+                continue;
+            };
+            let arc_i = EdgeDropGuard::new(manager, arc_i);
 
-                // Union of two already-saturated sets is saturated (relational image
-                // distributes over union), so no re-saturation is needed here.
-                let unioned = apply_union(manager, SequentialRecursor, existing_guard.borrowed(), f_guard.borrowed())?;
+            for event in events.iter().filter(|e| e.top == p) {
+                fired.extend(sat_fire_top(manager, event, &i, arc_i.borrowed(), events, num_levels, epoch)?);
+            }
+        }
 
-                let changed = arcs.get(&j).is_none_or(|old| *old != unioned);
-                if changed {
-                    if let Some(old) = arcs.insert(j.clone(), unioned) {
-                        manager.drop_edge(old);
-                    }
-                    if !work.contains(&j) {
-                        work.push_back(j);
-                    }
-                } else {
-                    manager.drop_edge(unioned);
+        for (j, f) in fired {
+            let single = EdgeDropGuard::new(
+                manager,
+                make_node(manager, &j, f, manager.get_terminal(LDDTerminal::Empty)?)?,
+            );
+
+            // Union of two already-saturated sets is saturated (relational image distributes over
+            // union), so no re-saturation is needed here.
+            let unioned = EdgeDropGuard::new(
+                manager,
+                apply_union(manager, SequentialRecursor, node.borrowed(), single.borrowed())?,
+            );
+
+            // Only `j`'s continuation can differ, so if the union changed anything, `j` is what
+            // changed.
+            if *unioned != *node {
+                node = unioned;
+                if !frontier.contains(&j) {
+                    frontier.push(j);
                 }
             }
         }
     }
 
-    // (3) Commit once: build the node chain in descending value order so the
-    // resulting right-spine is ascending, matching every other LDD builder
-    // in this crate (see `apply_union`'s `Ordering::Less` case).
-    let mut result = manager.get_terminal(LDDTerminal::Empty)?;
-    for (value, down) in arcs.into_iter().rev() {
-        if manager.get_node(&down).is_terminal(&LDDTerminal::Empty) {
-            manager.drop_edge(down);
-            continue;
-        }
-        let down_guard = EdgeDropGuard::new(manager, down);
-        let result_guard = EdgeDropGuard::new(manager, result);
-        result = make_node(manager, &value, down_guard.into_edge(), result_guard.into_edge())?;
-    }
+    let result = node.into_edge();
 
     manager.apply_cache().add_extended(
         manager,
@@ -182,6 +133,7 @@ pub(crate) fn saturate<M: LDDManager>(
         (&[q.borrowed()], &[epoch]),
         (&[result.borrowed()], &[]),
     );
+
     // `result` is already saturated (it is the fixed point we just computed), so this is a free
     // cache hit for any later `saturate` call that happens to reach the same node directly.
     if result != *q {
