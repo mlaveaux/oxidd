@@ -480,9 +480,9 @@ where
     /// do not depend on the events and are kept.
     #[inline]
     pub fn clear_saturation_cache<'id>(manager: &<LDDFunction<F> as Function>::Manager<'id>) {
-        manager
-            .apply_cache()
-            .clear_operators(manager, |op| matches!(op, LDDOp::Saturate | LDDOp::SatRecFire));
+        manager.apply_cache().clear_operators(manager, |op| {
+            matches!(op, LDDOp::Saturate | LDDOp::SatRecFire)
+        });
     }
 }
 
@@ -816,9 +816,9 @@ pub mod mt {
         /// See [`LDDFunction::clear_saturation_cache`].
         #[inline]
         pub fn clear_saturation_cache<'id>(manager: &<Self as Function>::Manager<'id>) {
-            manager
-                .apply_cache()
-                .clear_operators(manager, |op| matches!(op, LDDOp::Saturate | LDDOp::SatRecFire));
+            manager.apply_cache().clear_operators(manager, |op| {
+                matches!(op, LDDOp::Saturate | LDDOp::SatRecFire)
+            });
         }
     }
 }
