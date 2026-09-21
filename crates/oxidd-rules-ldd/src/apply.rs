@@ -469,13 +469,10 @@ pub(crate) fn apply_minus<M: LDDManager, R: Recursor<M>>(
 /// relation `rel`, guided by `meta` (produced by
 /// [`LDDFunction::relation_product_meta`]).
 ///
-/// Meta values at each level:
-/// - 0 – position not in the relation: keep set values, advance meta only.
-/// - 1 – read-only: match set and rel values; keep matched values in output.
-/// - 2 – write-only: union all set values, then write each rel value.
-/// - 3 – read half of a read+write pair: match values (not emitted); meta_down
-///   is 4.
-/// - 4 – write half of a read+write pair: write rel values.
+/// The case analysis is done by [`relational_product_step`]; this function
+/// adds the terminal cases, the apply cache, and the recursion strategy of a
+/// plain (unsaturated) relational product, where every recursive call is
+/// another cached call of this function.
 pub(crate) fn apply_relational_product<M: LDDManager, R: Recursor<M>>(
     manager: &M,
     rec: R,
@@ -488,25 +485,10 @@ pub(crate) fn apply_relational_product<M: LDDManager, R: Recursor<M>>(
     }
     stat!(call LDDOp::RelationalProduct);
 
-    // meta == True means all meta levels consumed; return set unchanged.
-    match manager.get_node(&meta) {
-        Node::Terminal(t) => {
-            debug_assert_eq!(
-                *t.borrow(),
-                LDDTerminal::True,
-                "meta should never reach the Empty terminal"
-            );
-            return Ok(manager.clone_edge(&set));
-        }
-        Node::Inner(_) => {}
-    }
-
-    // Empty set or empty relation → empty result.
-    if manager.get_node(&set).is_terminal(&LDDTerminal::Empty) {
-        return manager.get_terminal(LDDTerminal::Empty);
-    }
-    if manager.get_node(&rel).is_terminal(&LDDTerminal::Empty) {
-        return manager.get_terminal(LDDTerminal::Empty);
+    if let Some(result) =
+        relational_product_terminal(manager, set.borrowed(), rel.borrowed(), meta.borrowed())?
+    {
+        return Ok(result);
     }
 
     stat!(cache_query LDDOp::RelationalProduct);
@@ -519,14 +501,181 @@ pub(crate) fn apply_relational_product<M: LDDManager, R: Recursor<M>>(
         return Ok(res);
     }
 
+    let result = relational_product_step(
+        manager,
+        &mut CachedRecursion { manager, rec },
+        set.borrowed(),
+        rel.borrowed(),
+        meta.borrowed(),
+    )?;
+
+    manager.apply_cache().add(
+        manager,
+        LDDOp::RelationalProduct,
+        &[set, rel, meta],
+        result.borrowed(),
+    );
+
+    Ok(result)
+}
+
+/// Which state-vector position the result of a recursive call made by
+/// [`relational_product_step`] belongs to, relative to the position of the
+/// current call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Position {
+    /// The next position: the call resolves the continuation below a value
+    /// that was just decided.
+    Next,
+    /// The same position: the remaining entries of the current spine, or the
+    /// write half of a read+write pair (which does not advance the position).
+    Same,
+}
+
+/// The `(set, rel, meta)` arguments of a recursive relational product call.
+type ProductArgs<'a, M> = (
+    Borrowed<'a, <M as Manager>::Edge>,
+    Borrowed<'a, <M as Manager>::Edge>,
+    Borrowed<'a, <M as Manager>::Edge>,
+);
+
+/// How [`relational_product_step`] continues after it has dealt with the
+/// current level.
+///
+/// The step function is the same for the plain relational product
+/// ([`CachedRecursion`]) and for the one used by saturation, which has to
+/// saturate every node it builds at a new position. The two only differ in
+/// what a recursive call is, so that is what this trait abstracts.
+pub(crate) trait RelationalProductRecursion<M: LDDManager> {
+    /// The recursor used for the union operations of the step.
+    type Rec: Recursor<M>;
+
+    fn recursor(&self) -> Self::Rec;
+
+    /// Computes the relational product of the given arguments, where the
+    /// result belongs to `position`.
+    fn recurse(
+        &mut self,
+        position: Position,
+        set: Borrowed<M::Edge>,
+        rel: Borrowed<M::Edge>,
+        meta: Borrowed<M::Edge>,
+    ) -> AllocResult<M::Edge>;
+
+    /// Runs [`Self::recurse`] for `first` (at `position`) and for `second` (at
+    /// [`Position::Same`]).
+    ///
+    /// Implementations that can evaluate the two calls in parallel override
+    /// this.
+    fn recurse_pair<'a>(
+        &mut self,
+        manager: &'a M,
+        position: Position,
+        first: ProductArgs<'_, M>,
+        second: ProductArgs<'_, M>,
+    ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
+        let first = self.recurse(position, first.0, first.1, first.2)?;
+        let first = EdgeDropGuard::new(manager, first);
+        let second = self.recurse(Position::Same, second.0, second.1, second.2)?;
+        Ok((first, EdgeDropGuard::new(manager, second)))
+    }
+}
+
+/// The recursion of [`apply_relational_product`]: every continuation is a
+/// cached call of it, evaluated by the recursor `rec`.
+struct CachedRecursion<'a, M, R> {
+    manager: &'a M,
+    rec: R,
+}
+
+impl<M: LDDManager, R: Recursor<M>> RelationalProductRecursion<M> for CachedRecursion<'_, M, R> {
+    type Rec = R;
+
+    fn recursor(&self) -> R {
+        self.rec
+    }
+
+    fn recurse(
+        &mut self,
+        _position: Position,
+        set: Borrowed<M::Edge>,
+        rel: Borrowed<M::Edge>,
+        meta: Borrowed<M::Edge>,
+    ) -> AllocResult<M::Edge> {
+        apply_relational_product(self.manager, self.rec, set, rel, meta)
+    }
+
+    fn recurse_pair<'a>(
+        &mut self,
+        manager: &'a M,
+        _position: Position,
+        first: ProductArgs<'_, M>,
+        second: ProductArgs<'_, M>,
+    ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
+        self.rec
+            .ternary(apply_relational_product, manager, first, second)
+    }
+}
+
+/// Handles the cases of the relational product that need no recursion, and
+/// returns `None` if there is more to do.
+///
+/// - `meta` is `True`: all meta levels are consumed, `set` is returned
+///   unchanged.
+/// - `set` or `rel` is empty: the result is empty. For recursive calls this
+///   also covers running off the end of a spine.
+pub(crate) fn relational_product_terminal<M: LDDManager>(
+    manager: &M,
+    set: Borrowed<M::Edge>,
+    rel: Borrowed<M::Edge>,
+    meta: Borrowed<M::Edge>,
+) -> AllocResult<Option<M::Edge>> {
+    if let Node::Terminal(t) = manager.get_node(&meta) {
+        debug_assert_eq!(
+            *t.borrow(),
+            LDDTerminal::True,
+            "meta should never reach the Empty terminal"
+        );
+        return Ok(Some(manager.clone_edge(&set)));
+    }
+
+    if manager.get_node(&set).is_terminal(&LDDTerminal::Empty)
+        || manager.get_node(&rel).is_terminal(&LDDTerminal::Empty)
+    {
+        return Ok(Some(manager.get_terminal(LDDTerminal::Empty)?));
+    }
+
+    Ok(None)
+}
+
+/// Resolves the top level of the relational product of `set` and `rel`
+/// guided by `meta`, using `recursion` for everything below it.
+///
+/// `meta` must be an inner node, and neither `set` nor `rel` may be empty, see
+/// [`relational_product_terminal`]. No caching is done here.
+///
+/// Meta values at each level:
+/// - 0 – position not in the relation: keep set values, advance meta only.
+/// - 1 – read-only: match set and rel values; keep matched values in output.
+/// - 2 – write-only: union all set values, then write each rel value.
+/// - 3 – read half of a read+write pair: match values (not emitted); meta_down
+///   is 4.
+/// - 4 – write half of a read+write pair: write rel values.
+pub(crate) fn relational_product_step<M: LDDManager, T: RelationalProductRecursion<M>>(
+    manager: &M,
+    recursion: &mut T,
+    set: Borrowed<M::Edge>,
+    rel: Borrowed<M::Edge>,
+    meta: Borrowed<M::Edge>,
+) -> AllocResult<M::Edge> {
     let meta_node = match manager.get_node(&meta) {
         Node::Inner(n) => n.borrow(),
-        _ => unreachable!(),
+        Node::Terminal(_) => unreachable!("terminal meta is handled by the caller"),
     };
     let meta_value = meta_node.get_value();
     let (meta_down, _meta_right) = collect_children(meta_node);
 
-    let result = if *meta_value == M::InnerNodeValue::false_value() {
+    if *meta_value == M::InnerNodeValue::false_value() {
         // 0: not in relation — keep all set values, advance meta into next level.
         let set_node = match manager.get_node(&set) {
             Node::Inner(n) => n.borrow(),
@@ -535,26 +684,13 @@ pub(crate) fn apply_relational_product<M: LDDManager, R: Recursor<M>>(
         let set_value = set_node.get_value();
         let (set_down, set_right) = collect_children(set_node);
 
-        let (down_result, right_result) = rec.ternary(
-            apply_relational_product,
+        let (down_result, right_result) = recursion.recurse_pair(
             manager,
+            Position::Next,
             (set_down, rel.borrowed(), meta_down),
             (set_right, rel.borrowed(), meta.borrowed()),
         )?;
-
-        if manager
-            .get_node(&down_result)
-            .is_terminal(&LDDTerminal::Empty)
-        {
-            right_result.into_edge()
-        } else {
-            make_node(
-                manager,
-                set_value,
-                down_result.into_edge(),
-                right_result.into_edge(),
-            )?
-        }
+        make_node_unless_empty(manager, set_value, down_result, right_result)
     } else if *meta_value == M::InnerNodeValue::read_only_value() {
         // 1: read only — match set and rel values; keep matched values in output.
         let set_node = match manager.get_node(&set) {
@@ -571,34 +707,22 @@ pub(crate) fn apply_relational_product<M: LDDManager, R: Recursor<M>>(
         let (rel_down, rel_right) = collect_children(rel_node);
 
         match set_value.cmp(rel_value) {
+            // No rel entry for this set value; skip it.
             Ordering::Less => {
-                // No rel entry for this set value; skip it.
-                apply_relational_product(manager, rec, set_right, rel.borrowed(), meta.borrowed())?
+                recursion.recurse(Position::Same, set_right, rel.borrowed(), meta.borrowed())
             }
             Ordering::Equal => {
-                let (down_result, right_result) = rec.ternary(
-                    apply_relational_product,
+                let (down_result, right_result) = recursion.recurse_pair(
                     manager,
+                    Position::Next,
                     (set_down, rel_down, meta_down),
                     (set_right, rel_right, meta.borrowed()),
                 )?;
-                if manager
-                    .get_node(&down_result)
-                    .is_terminal(&LDDTerminal::Empty)
-                {
-                    right_result.into_edge()
-                } else {
-                    make_node(
-                        manager,
-                        set_value,
-                        down_result.into_edge(),
-                        right_result.into_edge(),
-                    )?
-                }
+                make_node_unless_empty(manager, set_value, down_result, right_result)
             }
+            // No set entry for this rel value; skip the rel value.
             Ordering::Greater => {
-                // No set entry for this rel value; skip the rel value.
-                apply_relational_product(manager, rec, set.borrowed(), rel_right, meta.borrowed())?
+                recursion.recurse(Position::Same, set.borrowed(), rel_right, meta.borrowed())
             }
         }
     } else if *meta_value == M::InnerNodeValue::write_only_value() {
@@ -611,65 +735,17 @@ pub(crate) fn apply_relational_product<M: LDDManager, R: Recursor<M>>(
         let rel_value = rel_node.get_value();
         let (rel_down, rel_right) = collect_children(rel_node);
 
-        // Collect union of all down-branches at this set level.
-        let combined = {
-            let mut acc = EdgeDropGuard::new(manager, manager.get_terminal(LDDTerminal::Empty)?);
-            let mut cur = EdgeDropGuard::new(manager, manager.clone_edge(&set));
-            loop {
-                let (down_owned, right_owned, right_empty) = {
-                    let cur_node = match manager.get_node(&cur) {
-                        Node::Inner(n) => n.borrow(),
-                        _ => unreachable!(),
-                    };
-                    let (cur_down, cur_right) = collect_children(cur_node);
-                    let empty = manager
-                        .get_node(&cur_right)
-                        .is_terminal(&LDDTerminal::Empty);
-                    (
-                        EdgeDropGuard::new(manager, manager.clone_edge(&cur_down)),
-                        EdgeDropGuard::new(manager, manager.clone_edge(&cur_right)),
-                        empty,
-                    )
-                };
-                let new_acc = EdgeDropGuard::new(
-                    manager,
-                    apply_union(manager, rec, acc.borrowed(), down_owned.borrowed())?,
-                );
-                // down_owned and acc are dropped via EdgeDropGuard
-                drop(down_owned);
-                acc = new_acc;
-                if right_empty {
-                    // right_owned is dropped via EdgeDropGuard
-                    break;
-                }
-                // old cur is dropped via EdgeDropGuard, replaced by right_owned
-                cur = right_owned;
-            }
-            // cur is dropped via EdgeDropGuard at end of block
-            acc.into_edge()
-        };
-
-        let combined_guard = EdgeDropGuard::new(manager, combined);
-        let (down_result, right_result) = rec.ternary(
-            apply_relational_product,
+        let combined = EdgeDropGuard::new(
             manager,
-            (combined_guard.borrowed(), rel_down, meta_down),
+            union_of_down_branches(manager, recursion.recursor(), set.borrowed())?,
+        );
+        let (down_result, right_result) = recursion.recurse_pair(
+            manager,
+            Position::Next,
+            (combined.borrowed(), rel_down, meta_down),
             (set.borrowed(), rel_right, meta.borrowed()),
         )?;
-
-        if manager
-            .get_node(&down_result)
-            .is_terminal(&LDDTerminal::Empty)
-        {
-            right_result.into_edge()
-        } else {
-            make_node(
-                manager,
-                rel_value,
-                down_result.into_edge(),
-                right_result.into_edge(),
-            )?
-        }
+        make_node_unless_empty(manager, rel_value, down_result, right_result)
     } else if *meta_value == M::InnerNodeValue::read_of_pair_value() {
         // 3: read half of a read+write pair — match values (not emitted);
         // union the matched continuation with the remaining-pairs result.
@@ -688,27 +764,27 @@ pub(crate) fn apply_relational_product<M: LDDManager, R: Recursor<M>>(
 
         match set_value.cmp(rel_value) {
             Ordering::Less => {
-                apply_relational_product(manager, rec, set_right, rel.borrowed(), meta.borrowed())?
+                recursion.recurse(Position::Same, set_right, rel.borrowed(), meta.borrowed())
             }
             Ordering::Equal => {
                 // meta_down should be write_of_pair_value (4); it introduces
                 // the new values.  Union with the right-siblings result so all
                 // (read, write) pairs at this level are considered.
-                let (down_result, right_result) = rec.ternary(
-                    apply_relational_product,
+                let (down_result, right_result) = recursion.recurse_pair(
                     manager,
+                    Position::Same,
                     (set_down, rel_down, meta_down),
                     (set_right, rel_right, meta.borrowed()),
                 )?;
                 apply_union(
                     manager,
-                    rec,
+                    recursion.recursor(),
                     down_result.borrowed(),
                     right_result.borrowed(),
-                )?
+                )
             }
             Ordering::Greater => {
-                apply_relational_product(manager, rec, set.borrowed(), rel_right, meta.borrowed())?
+                recursion.recurse(Position::Same, set.borrowed(), rel_right, meta.borrowed())
             }
         }
     } else if *meta_value == M::InnerNodeValue::write_of_pair_value() {
@@ -720,38 +796,77 @@ pub(crate) fn apply_relational_product<M: LDDManager, R: Recursor<M>>(
         let rel_value = rel_node.get_value();
         let (rel_down, rel_right) = collect_children(rel_node);
 
-        let (down_result, right_result) = rec.ternary(
-            apply_relational_product,
+        let (down_result, right_result) = recursion.recurse_pair(
             manager,
+            Position::Next,
             (set.borrowed(), rel_down, meta_down),
             (set.borrowed(), rel_right, meta.borrowed()),
         )?;
-
-        if manager
-            .get_node(&down_result)
-            .is_terminal(&LDDTerminal::Empty)
-        {
-            right_result.into_edge()
-        } else {
-            make_node(
-                manager,
-                rel_value,
-                down_result.into_edge(),
-                right_result.into_edge(),
-            )?
-        }
+        make_node_unless_empty(manager, rel_value, down_result, right_result)
     } else {
         panic!("meta has unexpected value");
-    };
+    }
+}
 
-    manager.apply_cache().add(
+/// Iterates over the `(value, down)` entries of the spine of `rel` in ascending order of value,
+/// without changing any reference counts. The iterator is empty if `rel` is the Empty terminal.
+///
+/// The yielded edges are only valid as long as `rel` is kept alive by the caller.
+pub(crate) struct Spine<'a, M: LDDManager> {
+    manager: &'a M,
+    cur: Option<Borrowed<'a, M::Edge>>,
+}
+
+pub(crate) fn spine<'a, M: LDDManager>(manager: &'a M, rel: Borrowed<'a, M::Edge>) -> Spine<'a, M> {
+    Spine {
         manager,
-        LDDOp::RelationalProduct,
-        &[set, rel, meta],
-        result.borrowed(),
-    );
+        cur: Some(rel),
+    }
+}
 
-    Ok(result)
+impl<'a, M: LDDManager> Iterator for Spine<'a, M> {
+    type Item = (&'a M::InnerNodeValue, Borrowed<'a, M::Edge>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cur = self.cur.take()?;
+        // A spine ends at the Empty terminal.
+        let Node::Inner(node) = self.manager.get_node(&cur) else {
+            return None;
+        };
+        let (down, right) = collect_children(node);
+        self.cur = Some(right);
+        Some((node.get_value(), down))
+    }
+}
+
+/// Returns the union of all down-branches of `set`'s spine, ignoring the
+/// specific values: the continuation shared by every value once a write-only
+/// position makes it unconstrained.
+pub(crate) fn union_of_down_branches<M: LDDManager, R: Recursor<M>>(
+    manager: &M,
+    rec: R,
+    set: Borrowed<M::Edge>,
+) -> AllocResult<M::Edge> {
+    let mut acc = EdgeDropGuard::new(manager, manager.get_terminal(LDDTerminal::Empty)?);
+    for (_, down) in spine(manager, set) {
+        acc = EdgeDropGuard::new(manager, apply_union(manager, rec, acc.borrowed(), down)?);
+    }
+    Ok(acc.into_edge())
+}
+
+/// Creates the node `(value, down, right)`, or returns just `right` if `down`
+/// is empty, since then `value` has no continuation and is not in the set.
+fn make_node_unless_empty<M: LDDManager>(
+    manager: &M,
+    value: &M::InnerNodeValue,
+    down: EdgeDropGuard<M>,
+    right: EdgeDropGuard<M>,
+) -> AllocResult<M::Edge> {
+    if manager.get_node(&down).is_terminal(&LDDTerminal::Empty) {
+        Ok(right.into_edge())
+    } else {
+        make_node(manager, value, down.into_edge(), right.into_edge())
+    }
 }
 
 /// Computes the intersection `a ∩ b` of the two sets of vectors.
