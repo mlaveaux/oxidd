@@ -5,7 +5,7 @@ use std::hash::Hash;
 
 use oxidd_core::{
     function::{EdgeOfFunc, Function, OwnEdgeOfFunc},
-    util::{AllocResult, Borrowed, EdgeDropGuard, Own, Ref},
+    util::{AllocResult, EdgeDropGuard, Own, Ref},
     ApplyCache, DiagramRules, Edge, HasApplyCache, HasLevel, InnerNode, LevelNo, Manager,
     ManagerRef, ReducedOrNew,
 };
