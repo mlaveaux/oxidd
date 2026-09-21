@@ -329,9 +329,7 @@ macro_rules! ldd_function_methods {
             /// Returns the number of vectors (lists) contained in `self`.
             ///
             /// The count is computed in the number type `N`, for example `u128` or
-            /// [`num::F64`][crate::util::num::F64], the same way as
-            /// [`BooleanFunction::sat_count`][oxidd_core::function::BooleanFunction::sat_count],
-            /// so it does not have to fit in a `u64`. Results per node are kept in `cache`.
+            /// [`num::F64`][crate::util::num::F64].
             pub fn len<N: ::oxidd_core::util::SatCountNumber, S: ::std::hash::BuildHasher>(
                 &self,
                 cache: &mut ::oxidd_core::util::SatCountCache<N, S>,
@@ -395,21 +393,21 @@ macro_rules! ldd_function_methods {
                 Ok(Self::from_edge(manager, edge))
             }
 
-            /// Returns `N*(self)`, the smallest superset of `self` closed under every event in
-            /// `events`, computed by node-wise saturation.
+            /// Returns `N*(self)`, the smallest superset of `self` closed under
+            /// every event in `events`, computed by node-wise saturation.
             /// 
-            /// > Ciardo, Marmorstein, Siminiceanu, *The saturation algorithm for symbolic state-space exploration*, STTT 2006.
+            /// > Ciardo, Marmorstein, Siminiceanu, *The saturation algorithm
+            /// > for symbolic state-space exploration*, STTT 2006.
             ///
-            /// Every vector in `self` must have the same length, and the events must fit within it.
-            /// Results are memoised on node identity, and the cache does not know the events: the
-            /// caller must call [`clear_saturation_cache`][Self::clear_saturation_cache] before
-            /// every `saturate` call whose events differ from those of an earlier call on this
-            /// manager. Skipping this is the single most likely way to get a silently wrong result:
-            /// a node cached as saturated under an older, smaller relation would otherwise be reused
-            /// as if it still were.
+            /// Every vector in `self` must have the same length, and the events
+            /// must fit within it. Intermediate results are memoised on node
+            /// identity in the apply cache, and the key does not contain the
+            /// events. `epoch` stands in for them, and must be changed when the
+            /// event relations change.
             pub fn saturate(
                 &self,
                 events: &[$crate::ldd::SaturationEvent],
+                epoch: u32,
             ) -> ::oxidd_core::util::AllocResult<Self> {
                 use ::oxidd_core::Manager;
                 use ::oxidd_core::ManagerRef;
@@ -427,7 +425,7 @@ macro_rules! ldd_function_methods {
 
                     let set = manager.clone_edge(self.as_edge(manager));
                     let result =
-                        FunctionInner::saturate_edge(manager, set, &owned_events);
+                        FunctionInner::saturate_edge(manager, set, &owned_events, epoch);
 
                     for event in owned_events {
                         manager.drop_edge(event.relation);
@@ -436,15 +434,6 @@ macro_rules! ldd_function_methods {
 
                     Ok(Self(FunctionInner::from_edge(manager, result?)))
                 })
-            }
-
-            /// Removes the cached results of [`saturate`][Self::saturate], and nothing else. Call
-            /// it before a `saturate` call whose events differ from those of the previous call.
-            /// The cached results of every other operation do not depend on the events and stay.
-            pub fn clear_saturation_cache(
-                manager: &<Self as ::oxidd_core::function::Function>::Manager<'_>,
-            ) {
-                FunctionInner::clear_saturation_cache(manager);
             }
 
             /// Returns a stable identifier for the root node of `self`, suitable
