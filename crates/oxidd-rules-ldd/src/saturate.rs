@@ -48,12 +48,15 @@ pub(crate) fn saturate<M: LDDManager>(
 ) -> AllocResult<M::Edge> {
     let saturation = Saturation { manager, events };
     let mut scratch = Scratch {
+        arcs: Vec::new(),
         frontier: Vec::new(),
         fired: Vec::new(),
     };
 
     let result = saturation.saturate_rec(&mut scratch, q, p);
-    debug_assert!(scratch.frontier.is_empty() && scratch.fired.is_empty());
+    debug_assert!(
+        scratch.arcs.is_empty() && scratch.frontier.is_empty() && scratch.fired.is_empty()
+    );
     result
 }
 
@@ -69,24 +72,27 @@ struct Saturation<'a, M: LDDManager> {
 
 /// Buffers that are shared by every recursive call, such that saturating a node does not allocate.
 ///
-/// Both are used as stacks: a call remembers the length on entry, only touches the entries above
-/// it, and truncates back to that length before returning. Nested calls therefore never observe or
-/// disturb the entries of their callers. All of them are empty again when the outermost call
-/// returns.
+/// All of them are used as stacks: a call remembers the length on entry, only touches the entries
+/// above it, and truncates back to that length before returning. Nested calls therefore never
+/// observe or disturb the entries of their callers. All of them are empty again when the outermost
+/// call returns.
 struct Scratch<M: LDDManager> {
-    /// The values of the node being saturated whose continuation still has to be fired.
+    /// The accumulator of the node being saturated: its `(value, continuation)` pairs, sorted
+    /// ascending by value. The continuation of a value is replaced by a bigger one whenever firing
+    /// an event grows it, and values that were not in the node can be inserted anywhere.
+    arcs: Vec<(M::InnerNodeValue, M::Edge)>,
+    /// The values of the node being saturated whose continuation still has to be fired, used as a
+    /// FIFO queue.
     frontier: Vec<M::InnerNodeValue>,
-    /// The `(value, subtree)` pairs produced by firing the events out of the frontier.
+    /// The `(value, subtree)` pairs produced by firing the events out of one value.
     fired: Vec<(M::InnerNodeValue, M::Edge)>,
 }
 
 impl<M: LDDManager> Saturation<'_, M> {
     /// Implements [`saturate`], using (and restoring) the shared `scratch` buffers.
     ///
-    /// The node is saturated in two steps: (1) saturate the children, which gives a node that is
-    /// closed under all events *below* position `p`, and (2) close it under the events *at* `p`.
-    ///
-    /// Memoised on node identity via `LDDOp::Saturate`.
+    /// Memoised on node identity via `LDDOp::Saturate`; see [`Self::saturate_node`] for the
+    /// computation itself. If it fails, everything it left in `scratch` is released.
     fn saturate_rec(
         &self,
         scratch: &mut Scratch<M>,
@@ -111,121 +117,22 @@ impl<M: LDDManager> Saturation<'_, M> {
             return Ok(res);
         }
 
-        // (1) Right to left: saturate the tail of the spine first, so it is already closed under
-        // the events at this level, and then put the head value in front of it. The head can only
-        // ever add to the tail (events may also write values smaller than the head, so this must
-        // be a union rather than a `make_node`), which means no intermediate accumulator is
-        // needed: every intermediate result is an ordinary, immutable node.
-        //
-        // The children are only borrowed: `q` keeps them alive for the whole call.
-        let q_node = match manager.get_node(&q) {
-            Node::Inner(n) => n.borrow(),
-            Node::Terminal(_) => unreachable!("terminals are handled above"),
-        };
-        let value = q_node.get_value();
-        let (down, right) = collect_children(q_node);
-
-        let right_sat = EdgeDropGuard::new(manager, self.saturate_rec(scratch, right, p)?);
-        let down_sat = EdgeDropGuard::new(manager, self.saturate_rec(scratch, down, p + 1)?);
-
-        // If everything in the saturated tail is larger than the head value, then the head can be
-        // put in front of it directly. Otherwise events wrote values smaller than the head into the
-        // tail, and the two have to be merged.
-        let mut node = if spine_starts_after(manager, right_sat.borrowed(), value) {
-            EdgeDropGuard::new(
-                manager,
-                make_node(manager, value, down_sat.into_edge(), right_sat.into_edge())?,
-            )
-        } else {
-            let head = EdgeDropGuard::new(
-                manager,
-                make_node(
-                    manager,
-                    value,
-                    down_sat.into_edge(),
-                    manager.get_terminal(LDDTerminal::Empty)?,
-                )?,
-            );
-            EdgeDropGuard::new(
-                manager,
-                apply_union(
-                    manager,
-                    SequentialRecursor,
-                    head.borrowed(),
-                    right_sat.borrowed(),
-                )?,
-            )
-        };
-
-        // (2) Fixpoint over the events confined to this level (`top(e) == p`): fire every such
-        // event out of the values on the frontier and union the result into the node. Only the
-        // head can have anything new to fire initially, since the tail is closed already.
-        // Afterwards only the values whose continuation actually changed need to fire again (the
-        // paper's pipelining).
+        let arcs_base = scratch.arcs.len();
         let frontier_base = scratch.frontier.len();
-        scratch.frontier.push(value.clone());
-        while scratch.frontier.len() > frontier_base {
-            let fired_base = scratch.fired.len();
-
-            // The nested calls made while firing push above and truncate back to the current
-            // length, so the frontier can be walked by index.
-            for index in frontier_base..scratch.frontier.len() {
-                let i = scratch.frontier[index].clone();
-                // `node` is not replaced while firing, so it keeps `arc_i` alive.
-                let Some(arc_i) = spine_lookup(manager, node.borrowed(), &i) else {
-                    continue;
-                };
-
-                for event in self.events.iter().filter(|e| e.top == p) {
-                    self.sat_fire_top(scratch, event, &i, arc_i.borrowed())?;
+        let fired_base = scratch.fired.len();
+        let result = match self.saturate_node(scratch, q.borrowed(), p, arcs_base, frontier_base) {
+            Ok(result) => result,
+            Err(err) => {
+                for (_, edge) in scratch.arcs.drain(arcs_base..) {
+                    manager.drop_edge(edge);
                 }
+                scratch.frontier.truncate(frontier_base);
+                for (_, edge) in scratch.fired.drain(fired_base..) {
+                    manager.drop_edge(edge);
+                }
+                return Err(err);
             }
-            scratch.frontier.truncate(frontier_base);
-
-            for (j, f) in scratch.fired.drain(fired_base..) {
-                let f = EdgeDropGuard::new(manager, f);
-
-                // Nothing to add if `j` already continues with exactly `f`.
-                if spine_lookup(manager, node.borrowed(), &j)
-                    .is_some_and(|existing| *existing == *f)
-                {
-                    continue;
-                }
-
-                let single = EdgeDropGuard::new(
-                    manager,
-                    make_node(
-                        manager,
-                        &j,
-                        f.into_edge(),
-                        manager.get_terminal(LDDTerminal::Empty)?,
-                    )?,
-                );
-
-                // Union of two already-saturated sets is saturated (relational image distributes
-                // over union), so no re-saturation is needed here.
-                let unioned = EdgeDropGuard::new(
-                    manager,
-                    apply_union(
-                        manager,
-                        SequentialRecursor,
-                        node.borrowed(),
-                        single.borrowed(),
-                    )?,
-                );
-
-                // Only `j`'s continuation can differ, so if the union changed anything, `j` is
-                // what changed.
-                if *unioned != *node {
-                    node = unioned;
-                    if !scratch.frontier[frontier_base..].contains(&j) {
-                        scratch.frontier.push(j);
-                    }
-                }
-            }
-        }
-
-        let result = node.into_edge();
+        };
 
         manager
             .apply_cache()
@@ -243,6 +150,108 @@ impl<M: LDDManager> Saturation<'_, M> {
             );
         }
 
+        Ok(result)
+    }
+
+    /// Computes the saturation of `q`, which sits at position `p`, on a cache miss.
+    ///
+    /// The node is saturated in three steps: (1) saturate the children, which gives the
+    /// continuations of a node that is closed under all events *below* position `p`, (2) close it
+    /// under the events *at* `p`, and (3) build the resulting node once.
+    fn saturate_node(
+        &self,
+        scratch: &mut Scratch<M>,
+        q: Borrowed<M::Edge>,
+        p: u32,
+        arcs_base: usize,
+        frontier_base: usize,
+    ) -> AllocResult<M::Edge> {
+        let manager = self.manager;
+
+        // (1) Saturate every child. The spine is ascending, so the accumulator starts out sorted.
+        for (value, down) in spine(manager, q) {
+            let down_sat = self.saturate_rec(scratch, down, p + 1)?;
+            scratch.arcs.push((value.clone(), down_sat));
+        }
+
+        // (2) Fixpoint over the events confined to this level (`top(e) == p`): fire every such
+        // event out of every value and unite the results into the accumulator, queueing the values
+        // whose continuation actually grew (the paper's pipelining).
+        scratch.frontier.extend(
+            scratch.arcs[arcs_base..]
+                .iter()
+                .map(|(value, _)| value.clone()),
+        );
+        
+        let mut next = frontier_base;
+        while next < scratch.frontier.len() {
+            let i = scratch.frontier[next].clone();
+            next += 1;
+
+            let arc_i = {
+                let pos = find_arc(&scratch.arcs[arcs_base..], &i)
+                    .expect("a queued value is in the accumulator");
+                EdgeDropGuard::new(
+                    manager,
+                    manager.clone_edge(&scratch.arcs[arcs_base + pos].1),
+                )
+            };
+
+            let fired_base = scratch.fired.len();
+            for event in self.events.iter().filter(|e| e.top == p) {
+                self.sat_fire_top(scratch, event, &i, arc_i.borrowed())?;
+            }
+            drop(arc_i);
+
+            for (j, f) in scratch.fired.drain(fired_base..) {
+                let f = EdgeDropGuard::new(manager, f);
+
+                match scratch.arcs[arcs_base..].binary_search_by(|(value, _)| value.cmp(&j)) {
+                    Ok(pos) => {
+                        let arc_j = &mut scratch.arcs[arcs_base + pos].1;
+
+                        // Nothing to add if `j` already continues with exactly `f`.
+                        if *arc_j == *f {
+                            continue;
+                        }
+
+                        // Union of two already-saturated sets is saturated (relational image
+                        // distributes over union), so no re-saturation is needed here.
+                        let unioned = apply_union(
+                            manager,
+                            SequentialRecursor,
+                            arc_j.borrowed(),
+                            f.borrowed(),
+                        )?;
+                        if unioned == *arc_j {
+                            manager.drop_edge(unioned);
+                            continue;
+                        }
+
+                        manager.drop_edge(std::mem::replace(arc_j, unioned));
+                        if !scratch.frontier[next..].contains(&j) {
+                            scratch.frontier.push(j);
+                        }
+                    }
+                    Err(pos) => {
+                        scratch
+                            .arcs
+                            .insert(arcs_base + pos, (j.clone(), f.into_edge()));
+                        scratch.frontier.push(j);
+                    }
+                }
+            }
+        }
+        scratch.frontier.truncate(frontier_base);
+
+        // (3) Build the node once, right to left, so the spine ends up ascending, matching every
+        // other LDD builder in this crate (see `apply_union`'s `Ordering::Less` case).
+        let mut result = manager.get_terminal(LDDTerminal::Empty)?;
+        while scratch.arcs.len() > arcs_base {
+            let (value, down) = scratch.arcs.pop().expect("the length was checked above");
+            let tail = EdgeDropGuard::new(manager, result);
+            result = make_node(manager, &value, down, tail.into_edge())?;
+        }
         Ok(result)
     }
 
@@ -491,14 +500,7 @@ fn spine_lookup<'a, M: LDDManager>(
     None
 }
 
-/// Returns whether every value on the spine of `rel` is strictly greater than `value`, which is
-/// trivially the case if `rel` is the Empty terminal.
-fn spine_starts_after<M: LDDManager>(
-    manager: &M,
-    rel: Borrowed<M::Edge>,
-    value: &M::InnerNodeValue,
-) -> bool {
-    spine(manager, rel)
-        .next()
-        .is_none_or(|(first, _)| first > value)
+/// Returns the position of `value` in the accumulator `arcs`, which is sorted ascending by value.
+fn find_arc<V: Ord, E>(arcs: &[(V, E)], value: &V) -> Option<usize> {
+    arcs.binary_search_by(|(v, _)| v.cmp(value)).ok()
 }
