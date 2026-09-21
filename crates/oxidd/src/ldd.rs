@@ -392,18 +392,16 @@ macro_rules! ldd_function_methods {
             /// 
             /// > Ciardo, Marmorstein, Siminiceanu, *The saturation algorithm for symbolic state-space exploration*, STTT 2006.
             ///
-            /// `self` must contain vectors of length `num_levels`. Results are memoised on node
-            /// identity and `epoch`: the caller must pass a fresh, never-before-used `epoch` — or
-            /// call [`clear_apply_cache`][Self::clear_apply_cache] and keep reusing the same one —
-            /// whenever any event's relation has changed since the previous `saturate` call on this
+            /// Every vector in `self` must have the same length, and the events must fit within it.
+            /// Results are memoised on node identity, and the cache does not know the events: the
+            /// caller must call [`clear_saturation_cache`][Self::clear_saturation_cache] before
+            /// every `saturate` call whose events differ from those of an earlier call on this
             /// manager. Skipping this is the single most likely way to get a silently wrong result:
             /// a node cached as saturated under an older, smaller relation would otherwise be reused
             /// as if it still were.
             pub fn saturate(
                 &self,
                 events: &[$crate::ldd::SaturationEvent],
-                num_levels: u32,
-                epoch: u32,
             ) -> ::oxidd_core::util::AllocResult<Self> {
                 use ::oxidd_core::Manager;
                 use ::oxidd_core::ManagerRef;
@@ -421,7 +419,7 @@ macro_rules! ldd_function_methods {
 
                     let set = manager.clone_edge(self.as_edge(manager));
                     let result =
-                        FunctionInner::saturate_edge(manager, set, &owned_events, num_levels, epoch);
+                        FunctionInner::saturate_edge(manager, set, &owned_events);
 
                     for event in owned_events {
                         manager.drop_edge(event.relation);
@@ -432,12 +430,13 @@ macro_rules! ldd_function_methods {
                 })
             }
 
-            /// Clears the apply cache. An alternative to bumping `epoch` between two
-            /// [`saturate`][Self::saturate] calls whose events have changed.
-            pub fn clear_apply_cache(
+            /// Removes the cached results of [`saturate`][Self::saturate], and nothing else. Call
+            /// it before a `saturate` call whose events differ from those of the previous call.
+            /// The cached results of every other operation do not depend on the events and stay.
+            pub fn clear_saturation_cache(
                 manager: &<Self as ::oxidd_core::function::Function>::Manager<'_>,
             ) {
-                FunctionInner::clear_apply_cache(manager);
+                FunctionInner::clear_saturation_cache(manager);
             }
 
             /// Returns a stable identifier for the root node of `self`, suitable
@@ -471,7 +470,7 @@ mod index {
         terminals: 2,
     });
 
-    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 6);
+    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 5);
 
     crate::util::manager_ref_index_based!(pub struct LDDManagerRef(<LDD as DD>::ManagerRef) with LDDManagerData);
 
@@ -512,7 +511,7 @@ mod pointer {
         tag_bits: 2,
     });
 
-    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 6);
+    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 5);
 
     crate::util::manager_ref_pointer_based!(pub struct LDDManagerRef(<LDD as DD>::ManagerRef) with LDDManagerData);
 

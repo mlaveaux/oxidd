@@ -461,26 +461,30 @@ where
     /// computed by node-wise saturation (see [`crate::saturate`]) rather than whole-set fixpoint
     /// iteration.
     ///
-    /// `set` must contain vectors of length `num_levels`. The `epoch` parameter is used to
-    /// distinguish different saturation runs and should be incremented or changed whenever the
-    /// events have changed since the previous call.
+    /// The vectors in `set` may have any length, as long as it is the same for all of them and the
+    /// events fit within it.
+    ///
+    /// The results are cached, and the cache does not know the events. Call
+    /// [`clear_saturation_cache`][Self::clear_saturation_cache] before every call whose events differ
+    /// from those of an earlier call on this manager, otherwise the result can be silently wrong.
     #[inline]
     pub fn saturate_edge<'id>(
         manager: &<LDDFunction<F> as Function>::Manager<'id>,
         set: EdgeOfFunc<'id, Self>,
         events: &[SaturationEvent<EdgeOfFunc<'id, Self>>],
-        num_levels: u32,
-        epoch: u32,
     ) -> AllocResult<EdgeOfFunc<'id, Self>> {
         let set = EdgeDropGuard::new(manager, set);
-        crate::saturate::saturate(manager, set.borrowed(), 0, events, num_levels, epoch)
+        crate::saturate::saturate(manager, set.borrowed(), 0, events)
     }
 
-    /// Clears the apply cache. An alternative to bumping `epoch` between two
-    /// [`saturate_edge`][Self::saturate_edge] calls whose events have changed.
+    /// Removes the cached results of [`saturate_edge`][Self::saturate_edge] (`LDDOp::Saturate` and
+    /// `LDDOp::SatRecFire`) from the apply cache, and nothing else. Results of every other operation
+    /// do not depend on the events and are kept.
     #[inline]
-    pub fn clear_apply_cache<'id>(manager: &<LDDFunction<F> as Function>::Manager<'id>) {
-        manager.apply_cache().clear(manager);
+    pub fn clear_saturation_cache<'id>(manager: &<LDDFunction<F> as Function>::Manager<'id>) {
+        manager
+            .apply_cache()
+            .clear_operators(manager, |op| matches!(op, LDDOp::Saturate | LDDOp::SatRecFire));
     }
 }
 
@@ -806,17 +810,17 @@ pub mod mt {
             manager: &<Self as Function>::Manager<'id>,
             set: EdgeOfFunc<'id, Self>,
             events: &[SaturationEvent<EdgeOfFunc<'id, Self>>],
-            num_levels: u32,
-            epoch: u32,
         ) -> AllocResult<EdgeOfFunc<'id, Self>> {
             let set = EdgeDropGuard::new(manager, set);
-            crate::saturate::saturate(manager, set.borrowed(), 0, events, num_levels, epoch)
+            crate::saturate::saturate(manager, set.borrowed(), 0, events)
         }
 
-        /// See [`LDDFunction::clear_apply_cache`].
+        /// See [`LDDFunction::clear_saturation_cache`].
         #[inline]
-        pub fn clear_apply_cache<'id>(manager: &<Self as Function>::Manager<'id>) {
-            manager.apply_cache().clear(manager);
+        pub fn clear_saturation_cache<'id>(manager: &<Self as Function>::Manager<'id>) {
+            manager
+                .apply_cache()
+                .clear_operators(manager, |op| matches!(op, LDDOp::Saturate | LDDOp::SatRecFire));
         }
     }
 }
