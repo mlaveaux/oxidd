@@ -5,7 +5,7 @@ use std::hash::{BuildHasher, Hash};
 use oxidd_core::{
     function::{EdgeOfFunc, Function},
     util::{AllocResult, Borrowed, EdgeDropGuard},
-    ApplyCache, DiagramRules, Edge, HasApplyCache, HasLevel, InnerNode, LevelNo, Manager,
+    DiagramRules, Edge, HasApplyCache, HasLevel, InnerNode, LevelNo, Manager,
     ManagerRef, ReducedOrNew,
 };
 use oxidd_derive::{Countable, Function};
@@ -50,11 +50,12 @@ pub enum LDDOp {
 
     Minus,
 
-    /// Node-wise saturation (`Sat_p`, see [`crate::saturate`]).
+    /// Node-wise saturation (`Sat_p`, see [`crate::saturate`]). The cache key also holds the
+    /// epoch, because the result depends on the events.
     Saturate,
 
     /// The recursive, node-saturating half of one event's firing below its `top` level (see
-    /// [`crate::saturate`]).
+    /// [`crate::saturate`]). The cache key also holds the epoch.
     SatRecFire,
 }
 
@@ -473,27 +474,22 @@ where
     /// The vectors in `set` may have any length, as long as it is the same for all of them and the
     /// events fit within it.
     ///
-    /// The results are cached, and the cache does not know the events. Call
-    /// [`clear_saturation_cache`][Self::clear_saturation_cache] before every call whose events differ
-    /// from those of an earlier call on this manager, otherwise the result can be silently wrong.
+    /// Intermediate results are memoised in the apply cache, and the key does not contain the events.
+    /// `epoch` stands in for them: every call with the same `epoch` on a manager shares its cached
+    /// results, so it must only be reused for calls with exactly the same events, and has to be
+    /// changed as soon as the events differ, for example when a relation has grown. Using one epoch for
+    /// different events can silently give a wrong result, while a new epoch is always correct and only
+    /// gives up the reuse of earlier results. Nothing has to be swept, since entries of other epochs
+    /// never match and are overwritten like any other entry.
     #[inline]
     pub fn saturate_edge<'id>(
         manager: &<LDDFunction<F> as Function>::Manager<'id>,
         set: EdgeOfFunc<'id, Self>,
         events: &[SaturationEvent<EdgeOfFunc<'id, Self>>],
+        epoch: u32,
     ) -> AllocResult<EdgeOfFunc<'id, Self>> {
         let set = EdgeDropGuard::new(manager, set);
-        crate::saturate::saturate(manager, set.borrowed(), 0, events)
-    }
-
-    /// Removes the cached results of [`saturate_edge`][Self::saturate_edge] (`LDDOp::Saturate` and
-    /// `LDDOp::SatRecFire`) from the apply cache, and nothing else. Results of every other operation
-    /// do not depend on the events and are kept.
-    #[inline]
-    pub fn clear_saturation_cache<'id>(manager: &<LDDFunction<F> as Function>::Manager<'id>) {
-        manager.apply_cache().clear_operators(manager, |op| {
-            matches!(op, LDDOp::Saturate | LDDOp::SatRecFire)
-        });
+        crate::saturate::saturate(manager, set.borrowed(), 0, events, epoch)
     }
 }
 
@@ -821,17 +817,10 @@ pub mod mt {
             manager: &<Self as Function>::Manager<'id>,
             set: EdgeOfFunc<'id, Self>,
             events: &[SaturationEvent<EdgeOfFunc<'id, Self>>],
+            epoch: u32,
         ) -> AllocResult<EdgeOfFunc<'id, Self>> {
             let set = EdgeDropGuard::new(manager, set);
-            crate::saturate::saturate(manager, set.borrowed(), 0, events)
-        }
-
-        /// See [`LDDFunction::clear_saturation_cache`].
-        #[inline]
-        pub fn clear_saturation_cache<'id>(manager: &<Self as Function>::Manager<'id>) {
-            manager.apply_cache().clear_operators(manager, |op| {
-                matches!(op, LDDOp::Saturate | LDDOp::SatRecFire)
-            });
+            crate::saturate::saturate(manager, set.borrowed(), 0, events, epoch)
         }
     }
 }

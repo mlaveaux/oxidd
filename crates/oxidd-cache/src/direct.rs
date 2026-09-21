@@ -438,18 +438,6 @@ where
             entry.lock().clear();
         }
     }
-
-    fn clear_operators(&self, _manager: &M, predicate: impl Fn(O) -> bool) {
-        for entry in &*self.0 {
-            let mut entry = entry.lock();
-            // SAFETY: The entry is locked, and occupied entries have an
-            // initialized operator.
-            if entry.is_occupied() && predicate(unsafe { (*entry.0.operator.get()).assume_init() })
-            {
-                entry.clear();
-            }
-        }
-    }
 }
 
 impl<M, O, H, const ENTRY_CAP: usize> ManagerEventSubscriber<M> for DMApplyCache<M, O, H, ENTRY_CAP>

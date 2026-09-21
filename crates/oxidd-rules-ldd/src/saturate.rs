@@ -37,16 +37,21 @@ use crate::{LDDManager, LDDOp, LDDTerminal, LDDValue, SaturationEvent};
 /// closed under every event in `events` whose `top` is `>= p`, where `q` is
 /// known to sit at state-vector position `p`.
 ///
-/// The saturation cache entries do not depend on the events, so the caller must clear them
-/// (see [`LDDFunction::clear_saturation_cache`][crate::LDDFunction::clear_saturation_cache])
-/// between calls with different `events`.
+/// The results are memoised in the apply cache, keyed on `epoch`, which identifies `events`: calls
+/// with the same `epoch` share their cached results, so it has to differ whenever the events differ
+/// (see [`LDDFunction::saturate_edge`][crate::LDDFunction::saturate_edge]).
 pub(crate) fn saturate<M: LDDManager>(
     manager: &M,
     q: Borrowed<M::Edge>,
     p: u32,
     events: &[SaturationEvent<M::Edge>],
+    epoch: u32,
 ) -> AllocResult<M::Edge> {
-    let saturation = Saturation { manager, events };
+    let saturation = Saturation {
+        manager,
+        events,
+        epoch,
+    };
     let mut scratch = Scratch {
         arcs: Vec::new(),
         frontier: Vec::new(),
@@ -68,6 +73,8 @@ struct Saturation<'a, M: LDDManager> {
     manager: &'a M,
     /// Every event that can be fired.
     events: &'a [SaturationEvent<M::Edge>],
+    /// The number that identifies `events`, and that the cache entries of this call are keyed on.
+    epoch: u32,
 }
 
 /// Buffers that are shared by every recursive call, such that saturating a node does not allocate.
@@ -91,7 +98,7 @@ struct Scratch<M: LDDManager> {
 impl<M: LDDManager> Saturation<'_, M> {
     /// Implements [`saturate`], using (and restoring) the shared `scratch` buffers.
     ///
-    /// Memoised on node identity via `LDDOp::Saturate`; see [`Self::saturate_node`] for the
+    /// Memoised on node identity and the epoch via `LDDOp::Saturate`; see [`Self::saturate_node`] for the
     /// computation itself. If it fails, everything it left in `scratch` is released.
     fn saturate_rec(
         &self,
@@ -109,10 +116,11 @@ impl<M: LDDManager> Saturation<'_, M> {
         }
 
         stat!(cache_query LDDOp::Saturate);
-        if let Some(res) = manager
-            .apply_cache()
-            .get(manager, LDDOp::Saturate, &[q.borrowed()])
-        {
+        if let Some(([res], [])) = manager.apply_cache().get_extended::<1, 0>(
+            manager,
+            LDDOp::Saturate,
+            (&[q.borrowed()], &[self.epoch]),
+        ) {
             stat!(cache_hit LDDOp::Saturate);
             return Ok(res);
         }
@@ -134,19 +142,21 @@ impl<M: LDDManager> Saturation<'_, M> {
             }
         };
 
-        manager
-            .apply_cache()
-            .add(manager, LDDOp::Saturate, &[q.borrowed()], result.borrowed());
+        manager.apply_cache().add_extended(
+            manager,
+            LDDOp::Saturate,
+            (&[q.borrowed()], &[self.epoch]),
+            (&[result.borrowed()], &[]),
+        );
 
         // `result` is already saturated (it is the fixed point we just computed), so this is a
-        // free cache hit for any later `saturate` call that happens to reach the same node
-        // directly.
+        // free cache hit for any later node of this call that happens to reach it directly.
         if result != *q {
-            manager.apply_cache().add(
+            manager.apply_cache().add_extended(
                 manager,
                 LDDOp::Saturate,
-                &[result.borrowed()],
-                result.borrowed(),
+                (&[result.borrowed()], &[self.epoch]),
+                (&[result.borrowed()], &[]),
             );
         }
 
@@ -353,7 +363,7 @@ impl<M: LDDManager> Saturation<'_, M> {
     /// lies below the event's `top`. The result is saturated at `l` before it is returned, so it is safe to
     /// use as anyone's child.
     ///
-    /// Memoised on node identity via `LDDOp::SatRecFire`. Only calls that end up at a new
+    /// Memoised on node identity and the epoch via `LDDOp::SatRecFire`. Only calls that end up at a new
     /// position are memoised, and those are exactly the ones that saturate.
     fn sat_rec_fire(
         &self,
@@ -376,10 +386,13 @@ impl<M: LDDManager> Saturation<'_, M> {
         }
 
         stat!(cache_query LDDOp::SatRecFire);
-        if let Some(res) = manager.apply_cache().get(
+        if let Some(([res], [])) = manager.apply_cache().get_extended::<1, 0>(
             manager,
             LDDOp::SatRecFire,
-            &[q.borrowed(), rel.borrowed(), meta_l.borrowed()],
+            (
+                &[q.borrowed(), rel.borrowed(), meta_l.borrowed()],
+                &[self.epoch],
+            ),
         ) {
             stat!(cache_hit LDDOp::SatRecFire);
             return Ok(res);
@@ -399,11 +412,11 @@ impl<M: LDDManager> Saturation<'_, M> {
         let raw_guard = EdgeDropGuard::new(manager, raw);
         let result = self.saturate_rec(scratch, raw_guard.borrowed(), l)?;
 
-        manager.apply_cache().add(
+        manager.apply_cache().add_extended(
             manager,
             LDDOp::SatRecFire,
-            &[q, rel, meta_l],
-            result.borrowed(),
+            (&[q, rel, meta_l], &[self.epoch]),
+            (&[result.borrowed()], &[]),
         );
 
         Ok(result)

@@ -1237,14 +1237,6 @@ pub trait ApplyCache<M: Manager, O: Copy>: DropWith<M::Edge> {
 
     /// Remove all entries from the cache
     fn clear(&self, manager: &M);
-
-    /// Remove every entry whose operator satisfies `predicate`, and keep all
-    /// the others
-    ///
-    /// This is for operators whose results depend on state that is not part of
-    /// the key. Clearing just these leaves the entries of every other operator
-    /// usable.
-    fn clear_operators(&self, manager: &M, predicate: impl Fn(O) -> bool);
 }
 
 /// Apply cache container
