@@ -1,7 +1,6 @@
 //! List decision diagrams (LDDs) for OxiDD.
 
-use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 
 use oxidd_core::{
     function::{EdgeOfFunc, Function},
@@ -10,6 +9,8 @@ use oxidd_core::{
     ManagerRef, ReducedOrNew,
 };
 use oxidd_derive::{Countable, Function};
+
+use oxidd_core::util::{SatCountCache, SatCountNumber};
 
 use crate::apply::*;
 use crate::recursor::SequentialRecursor;
@@ -320,13 +321,20 @@ where
 
     /// Returns the number of vectors (lists) contained in the set rooted at
     /// `set`.
+    ///
+    /// Like [`sat_count_edge`][oxidd_core::function::BooleanFunction::sat_count_edge], the count
+    /// is computed in the number type `N` (for example `u128`, or `F64` for an approximation)
+    /// and the results per node are kept in `cache`, which can be reused for other sets.
     #[inline]
-    pub fn len_edge<'id>(
+    pub fn len_edge<'id, N: SatCountNumber, S: BuildHasher>(
         manager: &<LDDFunction<F> as Function>::Manager<'id>,
         set: EdgeOfFunc<'id, Self>,
-    ) -> usize {
+        cache: &mut SatCountCache<N, S>,
+    ) -> N {
+        // The LDD has no variables to count over, only its number of vectors matters.
+        cache.clear_if_invalid(manager, 0);
         let set = EdgeDropGuard::new(manager, set);
-        len(manager, set.borrowed(), &mut HashMap::new())
+        len(manager, set.borrowed(), &mut cache.map)
     }
 
     /// Computes a meta-LDD encoding the projection onto the indices in `proj`,
@@ -441,10 +449,11 @@ where
         })
     }
 
-    /// Returns the number of vectors (lists) contained in `self`.
-    pub fn len(&self) -> usize {
+    /// Returns the number of vectors (lists) contained in `self`, see
+    /// [`len_edge`][Self::len_edge].
+    pub fn len<N: SatCountNumber, S: BuildHasher>(&self, cache: &mut SatCountCache<N, S>) -> N {
         self.manager_ref().with_manager_shared(|manager| {
-            Self::len_edge(manager, manager.clone_edge(self.as_edge(manager)))
+            Self::len_edge(manager, manager.clone_edge(self.as_edge(manager)), cache)
         })
     }
 
@@ -670,12 +679,14 @@ pub mod mt {
 
         /// See [`LDDFunction::len_edge`].
         #[inline]
-        pub fn len_edge<'id>(
+        pub fn len_edge<'id, N: SatCountNumber, S: BuildHasher>(
             manager: &<Self as Function>::Manager<'id>,
             set: EdgeOfFunc<'id, Self>,
-        ) -> usize {
+            cache: &mut SatCountCache<N, S>,
+        ) -> N {
+            cache.clear_if_invalid(manager, 0);
             let set = EdgeDropGuard::new(manager, set);
-            len(manager, set.borrowed(), &mut HashMap::new())
+            len(manager, set.borrowed(), &mut cache.map)
         }
 
         /// See [`LDDFunction::projection_meta`].
@@ -785,9 +796,9 @@ pub mod mt {
         }
 
         /// See [`LDDFunction::len`].
-        pub fn len(&self) -> usize {
+        pub fn len<N: SatCountNumber, S: BuildHasher>(&self, cache: &mut SatCountCache<N, S>) -> N {
             self.manager_ref().with_manager_shared(|manager| {
-                Self::len_edge(manager, manager.clone_edge(self.as_edge(manager)))
+                Self::len_edge(manager, manager.clone_edge(self.as_edge(manager)), cache)
             })
         }
 

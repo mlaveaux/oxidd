@@ -327,8 +327,16 @@ macro_rules! ldd_function_methods {
             }
 
             /// Returns the number of vectors (lists) contained in `self`.
-            pub fn len(&self) -> usize {
-                self.0.len()
+            ///
+            /// The count is computed in the number type `N`, for example `u128` or
+            /// [`num::F64`][crate::util::num::F64], the same way as
+            /// [`BooleanFunction::sat_count`][oxidd_core::function::BooleanFunction::sat_count],
+            /// so it does not have to fit in a `u64`. Results per node are kept in `cache`.
+            pub fn len<N: ::oxidd_core::util::SatCountNumber, S: ::std::hash::BuildHasher>(
+                &self,
+                cache: &mut ::oxidd_core::util::SatCountCache<N, S>,
+            ) -> N {
+                self.0.len(cache)
             }
 
             /// Returns `true` if `self` is the empty set `∅`, i.e. contains no

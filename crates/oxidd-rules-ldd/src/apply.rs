@@ -7,8 +7,9 @@
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
-use oxidd_core::util::{AllocResult, Borrowed, EdgeDropGuard};
+use oxidd_core::util::{AllocResult, Borrowed, EdgeDropGuard, SatCountNumber};
 use oxidd_core::{ApplyCache, Edge, InnerNode, Manager, Node, NodeID};
 
 use crate::recursor::{Recursor, SequentialRecursor};
@@ -1468,17 +1469,21 @@ fn relational_predecessor_universe<M: LDDManager, R: Recursor<M>>(
 /// containing only the empty vector (the `True` terminal) contains exactly
 /// one. The counts of inner nodes are memoized in `cache` (keyed by
 /// [`NodeID`]) so that shared sub-diagrams are only counted once.
-pub(crate) fn len<M: LDDManager>(
+///
+/// The count is accumulated in `N`, so it does not overflow for number types that are big enough
+/// (the same as for the satisfiability count of the Boolean function types). Only `0`, `1` and
+/// additions are used.
+pub(crate) fn len<M: LDDManager, N: SatCountNumber, S: BuildHasher>(
     manager: &M,
     set: Borrowed<M::Edge>,
-    cache: &mut HashMap<NodeID, usize>,
-) -> usize {
+    cache: &mut HashMap<NodeID, N, S>,
+) -> N {
     match manager.get_node(&set) {
         Node::Terminal(t) => {
             return if *t.borrow() == LDDTerminal::True {
-                1
+                N::from(1)
             } else {
-                0
+                N::from(0)
             };
         }
         Node::Inner(_) => {}
@@ -1486,12 +1491,12 @@ pub(crate) fn len<M: LDDManager>(
 
     let node_id = set.node_id();
     if let Some(n) = cache.get(&node_id) {
-        return *n;
+        return n.clone();
     }
 
     // Walk the right spine, summing the sizes of all down-branches. The right
     // spine is terminated by the Empty terminal.
-    let mut result = 0;
+    let mut result = N::from(0);
     let mut current = EdgeDropGuard::new(manager, manager.clone_edge(&set));
     loop {
         let (down, right) = {
@@ -1505,14 +1510,14 @@ pub(crate) fn len<M: LDDManager>(
                 EdgeDropGuard::new(manager, manager.clone_edge(&right)),
             )
         };
-        result += len(manager, down.borrowed(), cache);
+        result = result + len(manager, down.borrowed(), cache);
         if manager.get_node(&right).is_terminal(&LDDTerminal::Empty) {
             break;
         }
         current = right;
     }
 
-    cache.insert(node_id, result);
+    cache.insert(node_id, result.clone());
     result
 }
 
