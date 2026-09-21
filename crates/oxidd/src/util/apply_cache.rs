@@ -82,4 +82,9 @@ impl<M: Manager, O: Copy, const ARITY: usize> oxidd_core::ApplyCache<M, O>
     fn clear(&self, _manager: &M) {
         // Nothing to do
     }
+
+    #[inline(always)]
+    fn clear_operators(&self, _manager: &M, _predicate: impl Fn(O) -> bool) {
+        // Nothing to do
+    }
 }
