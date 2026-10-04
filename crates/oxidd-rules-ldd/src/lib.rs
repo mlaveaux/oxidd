@@ -482,10 +482,10 @@ where
     #[inline]
     pub fn saturate_edge<'id>(
         manager: &<LDDFunction<F> as Function>::Manager<'id>,
-        set: EdgeOfFunc<'id, Self>,
-        events: &[SaturationEvent<EdgeOfFunc<'id, Self>>],
+        set: OwnEdgeOfFunc<'id, Self>,
+        events: &[SaturationEvent<OwnEdgeOfFunc<'id, Self>>],
         epoch: u32,
-    ) -> AllocResult<EdgeOfFunc<'id, Self>> {
+    ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
         let set = EdgeDropGuard::new(manager, set);
         crate::saturate::saturate(manager, set.borrowed(), 0, events, epoch)
     }
@@ -813,10 +813,10 @@ pub mod mt {
         #[inline]
         pub fn saturate_edge<'id>(
             manager: &<Self as Function>::Manager<'id>,
-            set: EdgeOfFunc<'id, Self>,
-            events: &[SaturationEvent<EdgeOfFunc<'id, Self>>],
+            set: OwnEdgeOfFunc<'id, Self>,
+            events: &[SaturationEvent<OwnEdgeOfFunc<'id, Self>>],
             epoch: u32,
-        ) -> AllocResult<EdgeOfFunc<'id, Self>> {
+        ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
             let set = EdgeDropGuard::new(manager, set);
             crate::saturate::saturate(manager, set.borrowed(), 0, events, epoch)
         }

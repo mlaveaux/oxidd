@@ -22,8 +22,8 @@
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 
-use oxidd_core::util::{AllocResult, Borrowed, EdgeDropGuard};
-use oxidd_core::{ApplyCache, Edge, InnerNode, Node};
+use oxidd_core::util::{AllocResult, EdgeDropGuard, Own, Ref};
+use oxidd_core::{ApplyCache, InnerNode, Node};
 
 use crate::apply::{
     apply_union, collect_children, make_node, relational_product_step, relational_product_terminal,
@@ -42,11 +42,11 @@ use crate::{LDDManager, LDDOp, LDDTerminal, LDDValue, SaturationEvent};
 /// (see [`LDDFunction::saturate_edge`][crate::LDDFunction::saturate_edge]).
 pub(crate) fn saturate<M: LDDManager>(
     manager: &M,
-    q: Borrowed<M::Edge>,
+    q: Ref<'_, M::Edge>,
     p: u32,
-    events: &[SaturationEvent<M::Edge>],
+    events: &[SaturationEvent<Own<M::Edge>>],
     epoch: u32,
-) -> AllocResult<M::Edge> {
+) -> AllocResult<Own<M::Edge>> {
     let saturation = Saturation {
         manager,
         events,
@@ -72,7 +72,7 @@ pub(crate) fn saturate<M: LDDManager>(
 struct Saturation<'a, M: LDDManager> {
     manager: &'a M,
     /// Every event that can be fired.
-    events: &'a [SaturationEvent<M::Edge>],
+    events: &'a [SaturationEvent<Own<M::Edge>>],
     /// The number that identifies `events`, and that the cache entries of this call are keyed on.
     epoch: u32,
 }
@@ -87,12 +87,12 @@ struct Scratch<M: LDDManager> {
     /// The accumulator of the node being saturated: its `(value, continuation)` pairs, sorted
     /// ascending by value. The continuation of a value is replaced by a bigger one whenever firing
     /// an event grows it, and values that were not in the node can be inserted anywhere.
-    arcs: Vec<(M::InnerNodeValue, M::Edge)>,
+    arcs: Vec<(M::InnerNodeValue, Own<M::Edge>)>,
     /// The values of the node being saturated whose continuation still has to be fired, used as a
     /// FIFO queue.
     frontier: Vec<M::InnerNodeValue>,
     /// The `(value, subtree)` pairs produced by firing the events out of one value.
-    fired: Vec<(M::InnerNodeValue, M::Edge)>,
+    fired: Vec<(M::InnerNodeValue, Own<M::Edge>)>,
 }
 
 impl<M: LDDManager> Saturation<'_, M> {
@@ -103,23 +103,23 @@ impl<M: LDDManager> Saturation<'_, M> {
     fn saturate_rec(
         &self,
         scratch: &mut Scratch<M>,
-        q: Borrowed<M::Edge>,
+        q: Ref<'_, M::Edge>,
         p: u32,
-    ) -> AllocResult<M::Edge> {
+    ) -> AllocResult<Own<M::Edge>> {
         let manager = self.manager;
 
         stat!(call LDDOp::Saturate);
 
         // Terminals are trivial fixed points of every event.
-        if let Node::Terminal(_) = manager.get_node(&q) {
-            return Ok(manager.clone_edge(&q));
+        if let Node::Terminal(_) = manager.get_node(q) {
+            return Ok(manager.clone_edge(q));
         }
 
         stat!(cache_query LDDOp::Saturate);
         if let Some(([res], [])) = manager.apply_cache().get_extended::<1, 0>(
             manager,
             LDDOp::Saturate,
-            (&[q.borrowed()], &[self.epoch]),
+            (&[q], &[self.epoch]),
         ) {
             stat!(cache_hit LDDOp::Saturate);
             return Ok(res);
@@ -128,7 +128,7 @@ impl<M: LDDManager> Saturation<'_, M> {
         let arcs_base = scratch.arcs.len();
         let frontier_base = scratch.frontier.len();
         let fired_base = scratch.fired.len();
-        let result = match self.saturate_node(scratch, q.borrowed(), p, arcs_base, frontier_base) {
+        let result = match self.saturate_node(scratch, q, p, arcs_base, frontier_base) {
             Ok(result) => result,
             Err(err) => {
                 for (_, edge) in scratch.arcs.drain(arcs_base..) {
@@ -145,13 +145,13 @@ impl<M: LDDManager> Saturation<'_, M> {
         manager.apply_cache().add_extended(
             manager,
             LDDOp::Saturate,
-            (&[q.borrowed()], &[self.epoch]),
+            (&[q], &[self.epoch]),
             (&[result.borrowed()], &[]),
         );
 
         // `result` is already saturated (it is the fixed point we just computed), so this is a
         // free cache hit for any later node of this call that happens to reach it directly.
-        if result != *q {
+        if result.borrowed() != q {
             manager.apply_cache().add_extended(
                 manager,
                 LDDOp::Saturate,
@@ -171,11 +171,11 @@ impl<M: LDDManager> Saturation<'_, M> {
     fn saturate_node(
         &self,
         scratch: &mut Scratch<M>,
-        q: Borrowed<M::Edge>,
+        q: Ref<'_, M::Edge>,
         p: u32,
         arcs_base: usize,
         frontier_base: usize,
-    ) -> AllocResult<M::Edge> {
+    ) -> AllocResult<Own<M::Edge>> {
         let manager = self.manager;
 
         // (1) Saturate every child. The spine is ascending, so the accumulator starts out sorted.
@@ -203,7 +203,7 @@ impl<M: LDDManager> Saturation<'_, M> {
                     .expect("a queued value is in the accumulator");
                 EdgeDropGuard::new(
                     manager,
-                    manager.clone_edge(&scratch.arcs[arcs_base + pos].1),
+                    manager.clone_edge(scratch.arcs[arcs_base + pos].1.borrowed()),
                 )
             };
 
@@ -282,15 +282,15 @@ impl<M: LDDManager> Saturation<'_, M> {
     fn sat_fire_top(
         &self,
         scratch: &mut Scratch<M>,
-        event: &SaturationEvent<M::Edge>,
+        event: &SaturationEvent<Own<M::Edge>>,
         i: &M::InnerNodeValue,
-        arc_i: Borrowed<M::Edge>,
+        arc_i: Ref<'_, M::Edge>,
     ) -> AllocResult<()> {
         let manager = self.manager;
         let l = event.top + 1;
 
         // Everything is borrowed from the event or from `arc_i`, both of which outlive this call.
-        let meta_node = match manager.get_node(&event.meta_at_top) {
+        let meta_node = match manager.get_node(event.meta_at_top.borrowed()) {
             Node::Inner(n) => n.borrow(),
             Node::Terminal(_) => {
                 unreachable!("an event always reads or writes at least one position")
@@ -304,7 +304,7 @@ impl<M: LDDManager> Saturation<'_, M> {
             // matching `i`.
             if let Some(rel_down) = spine_lookup(manager, event.relation.borrowed(), i) {
                 let f = self.sat_rec_fire(scratch, arc_i, rel_down, meta_down, l)?;
-                if manager.get_node(&f).is_terminal(&LDDTerminal::Empty) {
+                if manager.get_node(f.borrowed()).is_terminal(&LDDTerminal::Empty) {
                     manager.drop_edge(f);
                 } else {
                     scratch.fired.push((i.clone(), f));
@@ -315,8 +315,8 @@ impl<M: LDDManager> Saturation<'_, M> {
             // their (unconstrained by `i`) source.
             for (value, down) in spine(manager, event.relation.borrowed()) {
                 let f =
-                    self.sat_rec_fire(scratch, arc_i.borrowed(), down, meta_down.borrowed(), l)?;
-                if manager.get_node(&f).is_terminal(&LDDTerminal::Empty) {
+                    self.sat_rec_fire(scratch, arc_i, down, meta_down, l)?;
+                if manager.get_node(f.borrowed()).is_terminal(&LDDTerminal::Empty) {
                     manager.drop_edge(f);
                 } else {
                     scratch.fired.push((value.clone(), f));
@@ -326,7 +326,7 @@ impl<M: LDDManager> Saturation<'_, M> {
             // 3: read half of a read+write pair — match the relation entry equal to `i`; `meta_down`
             // is the paired write-half, whose own down-branch enumerates the possible written values.
             if let Some(rel_down) = spine_lookup(manager, event.relation.borrowed(), i) {
-                let write_meta_node = match manager.get_node(&meta_down) {
+                let write_meta_node = match manager.get_node(meta_down) {
                     Node::Inner(n) => n.borrow(),
                     Node::Terminal(_) => {
                         unreachable!("read-of-pair meta_down must be write-of-pair")
@@ -340,12 +340,12 @@ impl<M: LDDManager> Saturation<'_, M> {
                 for (value, down) in spine(manager, rel_down) {
                     let f = self.sat_rec_fire(
                         scratch,
-                        arc_i.borrowed(),
+                        arc_i,
                         down,
-                        write_meta_down.borrowed(),
+                        write_meta_down,
                         l,
                     )?;
-                    if manager.get_node(&f).is_terminal(&LDDTerminal::Empty) {
+                    if manager.get_node(f.borrowed()).is_terminal(&LDDTerminal::Empty) {
                         manager.drop_edge(f);
                     } else {
                         scratch.fired.push((value.clone(), f));
@@ -368,11 +368,11 @@ impl<M: LDDManager> Saturation<'_, M> {
     fn sat_rec_fire(
         &self,
         scratch: &mut Scratch<M>,
-        q: Borrowed<M::Edge>,
-        rel: Borrowed<M::Edge>,
-        meta_l: Borrowed<M::Edge>,
+        q: Ref<'_, M::Edge>,
+        rel: Ref<'_, M::Edge>,
+        meta_l: Ref<'_, M::Edge>,
         l: u32,
-    ) -> AllocResult<M::Edge> {
+    ) -> AllocResult<Own<M::Edge>> {
         let manager = self.manager;
         stat!(call LDDOp::SatRecFire);
 
@@ -380,7 +380,7 @@ impl<M: LDDManager> Saturation<'_, M> {
         // Below `bot(e)` the event is the identity, and `q` is already saturated (its creator did
         // that before it was ever used as a child), so it is returned unchanged.
         if let Some(result) =
-            relational_product_terminal(manager, q.borrowed(), rel.borrowed(), meta_l.borrowed())?
+            relational_product_terminal(manager, q, rel, meta_l)?
         {
             return Ok(result);
         }
@@ -390,7 +390,7 @@ impl<M: LDDManager> Saturation<'_, M> {
             manager,
             LDDOp::SatRecFire,
             (
-                &[q.borrowed(), rel.borrowed(), meta_l.borrowed()],
+                &[q, rel, meta_l],
                 &[self.epoch],
             ),
         ) {
@@ -405,9 +405,9 @@ impl<M: LDDManager> Saturation<'_, M> {
                 scratch: &mut *scratch,
                 l,
             },
-            q.borrowed(),
-            rel.borrowed(),
-            meta_l.borrowed(),
+            q,
+            rel,
+            meta_l,
         )?;
         let raw_guard = EdgeDropGuard::new(manager, raw);
         let result = self.saturate_rec(scratch, raw_guard.borrowed(), l)?;
@@ -431,17 +431,17 @@ impl<M: LDDManager> Saturation<'_, M> {
     fn rec_fire(
         &self,
         scratch: &mut Scratch<M>,
-        q: Borrowed<M::Edge>,
-        rel: Borrowed<M::Edge>,
-        meta_l: Borrowed<M::Edge>,
+        q: Ref<'_, M::Edge>,
+        rel: Ref<'_, M::Edge>,
+        meta_l: Ref<'_, M::Edge>,
         l: u32,
-    ) -> AllocResult<M::Edge> {
+    ) -> AllocResult<Own<M::Edge>> {
         let manager = self.manager;
 
         // A continuation to the right may run off the end of a spine, or a relation branch may be
         // empty: both simply mean there is nothing left to fire.
         if let Some(result) =
-            relational_product_terminal(manager, q.borrowed(), rel.borrowed(), meta_l.borrowed())?
+            relational_product_terminal(manager, q, rel, meta_l)?
         {
             return Ok(result);
         }
@@ -479,10 +479,10 @@ impl<M: LDDManager> RelationalProductRecursion<M> for FireRecursion<'_, '_, M> {
     fn recurse(
         &mut self,
         position: Position,
-        set: Borrowed<M::Edge>,
-        rel: Borrowed<M::Edge>,
-        meta: Borrowed<M::Edge>,
-    ) -> AllocResult<M::Edge> {
+        set: Ref<'_, M::Edge>,
+        rel: Ref<'_, M::Edge>,
+        meta: Ref<'_, M::Edge>,
+    ) -> AllocResult<Own<M::Edge>> {
         match position {
             Position::Next => {
                 self.saturation
@@ -500,9 +500,9 @@ impl<M: LDDManager> RelationalProductRecursion<M> for FireRecursion<'_, '_, M> {
 /// seen. Returns `None` if `rel` is the Empty terminal or has no matching entry.
 fn spine_lookup<'a, M: LDDManager>(
     manager: &'a M,
-    rel: Borrowed<'a, M::Edge>,
+    rel: Ref<'a, M::Edge>,
     i: &M::InnerNodeValue,
-) -> Option<Borrowed<'a, M::Edge>> {
+) -> Option<Ref<'a, M::Edge>> {
     for (value, down) in spine(manager, rel) {
         match value.cmp(i) {
             Ordering::Less => {}
