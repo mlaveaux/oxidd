@@ -3,8 +3,8 @@
 
 use std::collections::BTreeSet;
 
-use oxidd::ldd::{LDDFunction, LDDManagerRef, Value};
-use oxidd::util::AllocResult;
+use oxidd::ldd::{LDDFunction, LDDManagerRef, SaturationEvent, Value};
+use oxidd::util::{AllocResult, SatCountCache};
 use oxidd::{Function, HasWorkers, LevelNo, ManagerRef, WorkerPool};
 
 // spell-checker:ignore mref
@@ -37,6 +37,12 @@ fn from_vectors<V: AsRef<[Value]>>(
         result = result.union(&LDDFunction::singleton(manager, v.as_ref())?)?;
     }
     Ok(result)
+}
+
+/// Counts the vectors in `ldd` using [`LDDFunction::len()`].
+fn count(ldd: &LDDFunction) -> usize {
+    let mut cache = SatCountCache::<u64, std::hash::RandomState>::default();
+    ldd.len(&mut cache) as usize
 }
 
 /// Enumerates the vectors in `ldd` by walking its nodes.
@@ -209,12 +215,12 @@ fn terminals() -> AllocResult<()> {
 
         assert!(empty.is_empty());
         assert!(!empty.is_empty_vector());
-        assert_eq!(empty.len(), 0);
+        assert_eq!(count(&empty), 0);
         assert!(empty.node().is_none());
 
         assert!(!eps.is_empty());
         assert!(eps.is_empty_vector());
-        assert_eq!(eps.len(), 1);
+        assert_eq!(count(&eps), 1);
         assert!(eps.node().is_none());
 
         // The singleton of the empty vector is the `True` terminal
@@ -237,7 +243,7 @@ fn singleton_roundtrip() -> AllocResult<()> {
         ] {
             let f = LDDFunction::singleton(manager, &v)?;
             assert_eq!(to_vectors(&f), Vectors::from([v.clone()]), "for {v:?}");
-            assert_eq!(f.len(), 1);
+            assert_eq!(count(&f), 1);
         }
         Ok(())
     })
@@ -320,11 +326,15 @@ fn len_counts_vectors() -> AllocResult<()> {
     let mref = setup(1);
     mref.with_manager_shared(|manager| {
         for set in representative_sets(N) {
-            assert_eq!(from_vectors(manager, &set)?.len(), set.len(), "for {set:?}");
+            assert_eq!(
+                count(&from_vectors(manager, &set)?),
+                set.len(),
+                "for {set:?}"
+            );
         }
         // Shared sub-diagrams are counted once per path
         let f = from_vectors(manager, all_vectors(2 * N, 2))?;
-        assert_eq!(f.len(), 1 << (2 * N));
+        assert_eq!(count(&f), 1 << (2 * N));
         Ok(())
     })
 }
@@ -765,6 +775,131 @@ fn predecessors_within_universe() -> AllocResult<()> {
             set.relational_predecessors(&rel, &meta, &universe)?
                 == from_vectors(manager, [[0, 1, 0], [0, 1, 7]])?
         );
+        Ok(())
+    })
+}
+
+/// The definition of [`LDDFunction::saturate()`]: the least fixpoint of
+/// `naive_successors` over all events, starting from `set`.
+fn naive_saturate(set: &Vectors, events: &[(Vectors, Vec<LevelNo>, Vec<LevelNo>)]) -> Vectors {
+    let mut result = set.clone();
+    loop {
+        let mut next = result.clone();
+        for (rel, read, write) in events {
+            next.extend(naive_successors(&result, rel, read, write));
+        }
+        if next == result {
+            return result;
+        }
+        result = next;
+    }
+}
+
+/// Builds the [`SaturationEvent`] for the relation `rel` with the given `read`
+/// and `write` positions, which must not both be empty.
+fn saturation_event(
+    manager: &Manager<'_>,
+    rel: &Vectors,
+    read: &[LevelNo],
+    write: &[LevelNo],
+) -> AllocResult<SaturationEvent> {
+    let positions = || read.iter().chain(write);
+    let top = *positions().min().unwrap();
+    let bot = *positions().max().unwrap();
+
+    let mut meta_at_top = LDDFunction::relation_meta(manager, read, write)?.meta;
+    for _ in 0..top {
+        meta_at_top = meta_at_top.node().unwrap().1;
+    }
+    Ok(SaturationEvent {
+        relation: from_vectors(manager, rel)?,
+        meta_at_top,
+        top,
+        bot,
+    })
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn saturate_matches_naive() -> AllocResult<()> {
+    let mref = setup(1);
+    mref.with_manager_shared(|manager| {
+        let sets = representative_sets(N);
+
+        // Every single event
+        let mut events = Vec::new();
+        for (read, write) in configurations(N) {
+            if read.is_empty() && write.is_empty() {
+                continue;
+            }
+            for rel in representative_relations(&read, &write) {
+                events.push((rel, read.clone(), write.clone()));
+            }
+        }
+
+        // Every event on its own, and groups of events with different `top`
+        // levels, so that saturating a node fires events of several levels.
+        let mut groups: Vec<Vec<_>> = events.iter().map(|e| vec![e.clone()]).collect();
+        for stride in [7, 13] {
+            for start in 0..stride {
+                groups.push(
+                    events
+                        .iter()
+                        .skip(start)
+                        .step_by(stride)
+                        .take(4)
+                        .cloned()
+                        .collect(),
+                );
+            }
+        }
+
+        for (epoch, group) in groups.iter().enumerate() {
+            let ldd_events = group
+                .iter()
+                .map(|(rel, read, write)| saturation_event(manager, rel, read, write))
+                .collect::<AllocResult<Vec<_>>>()?;
+            for set in &sets {
+                let result = from_vectors(manager, set)?.saturate(&ldd_events, epoch as u32)?;
+                let expected = naive_saturate(set, group);
+                assert_eq!(
+                    to_vectors(&result),
+                    expected,
+                    "saturate {set:?} under {group:?}"
+                );
+                assert!(result == from_vectors(manager, &expected)?);
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn saturate_reaches_fixpoint() -> AllocResult<()> {
+    // A counter at position 1 that increments up to 4, and a second event at
+    // position 0 that is only enabled once the counter reached 4.
+    let mref = setup(1);
+    mref.with_manager_shared(|manager| {
+        let inc = (0..4).map(|i| vec![i, i + 1]).collect::<Vectors>();
+        // Relation vectors are laid out as `[a_0, b_0, a_1]`
+        let flip = Vectors::from([vec![0, 1, 4]]);
+        let events = [
+            saturation_event(manager, &inc, &[1], &[1])?,
+            saturation_event(manager, &flip, &[0, 1], &[0])?,
+        ];
+        let init = from_vectors(manager, [[0, 0, 0]])?;
+        let result = init.saturate(&events, 0)?;
+
+        let expected = (0..2)
+            .flat_map(|x| (0..5).map(move |c| vec![x, c, 0]))
+            .filter(|v| v[0] == 0 || v[1] == 4)
+            .collect::<Vectors>();
+        assert_eq!(to_vectors(&result), expected);
+
+        // The same epoch reuses the cached results
+        assert!(init.saturate(&events, 0)? == result);
+        // Without events, the set is returned unchanged
+        assert!(init.saturate(&[], 1)? == init);
         Ok(())
     })
 }

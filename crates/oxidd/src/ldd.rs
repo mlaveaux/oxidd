@@ -1,5 +1,7 @@
 //! List decision diagrams (LDDs)
 
+// spell-checker:ignore Ciardo,Marmorstein,Siminiceanu,STTT
+
 cfg_if::cfg_if! {
     if #[cfg(feature = "manager-pointer")] {
         pub use pointer::{LDDFunction, LDDManagerRef};
@@ -56,6 +58,24 @@ pub struct RelationMeta {
     pub read_positions: Vec<::oxidd_core::LevelNo>,
     /// The positions of the write values in the relation vectors.
     pub write_positions: Vec<::oxidd_core::LevelNo>,
+}
+
+/// One event (transition group) used by [`LDDFunction::saturate`].
+///
+/// See [`LDDFunction::relation_meta`] for how to compute `relation` and a full
+/// `meta`; `meta_at_top` must be `meta` descended `top` times (e.g., via
+/// repeated [`LDDFunction::node`]), so that its own root describes position
+/// `top` of the vectors.
+pub struct SaturationEvent {
+    /// The event's transition relation.
+    pub relation: LDDFunction,
+    /// The event's relation meta-LDD, descended `top` times.
+    pub meta_at_top: LDDFunction,
+    /// First (topmost) position of the vectors that this event reads or writes.
+    pub top: ::oxidd_core::LevelNo,
+    /// Last (bottommost) position of the vectors that this event reads or
+    /// writes.
+    pub bot: ::oxidd_core::LevelNo,
 }
 
 /// Generates the inherent methods of the public `LDDManagerRef` wrapper.
@@ -331,8 +351,65 @@ macro_rules! ldd_function_methods {
             }
 
             /// Returns the number of vectors (lists) contained in `self`.
-            pub fn len(&self) -> usize {
-                self.0.len()
+            ///
+            /// The count is computed in the number type `N`, for example `u128`
+            /// or [`num::F64`][crate::util::num::F64]. The counts per node are
+            /// kept in `cache`, which can be reused for other sets.
+            pub fn len<N: ::oxidd_core::util::SatCountNumber, S: ::std::hash::BuildHasher>(
+                &self,
+                cache: &mut ::oxidd_core::util::SatCountCache<N, S>,
+            ) -> N {
+                self.0.len(cache)
+            }
+
+            /// Returns `N*(self)`, the smallest superset of `self` closed under
+            /// every event in `events`, computed by node-wise saturation.
+            ///
+            /// > Ciardo, Marmorstein, Siminiceanu, *The saturation algorithm
+            /// > for symbolic state-space exploration*, STTT 2006.
+            ///
+            /// Every vector in `self` must have the same length, and the events
+            /// must fit within it. Intermediate results are memoized in the
+            /// apply cache, and the key does not contain the events. `epoch`
+            /// stands in for them, and must be changed whenever the events
+            /// change.
+            pub fn saturate(
+                &self,
+                events: &[$crate::ldd::SaturationEvent],
+                epoch: u32,
+            ) -> ::oxidd_core::util::AllocResult<Self> {
+                use ::oxidd_core::function::Function;
+                self.with_manager_shared(|manager, _| {
+                    Self::saturate_edge(manager, 0, self, events, epoch)
+                })
+            }
+
+            /// Computes the saturation of `set`, which resides at `level`,
+            /// using the already-borrowed `manager`; the lock-free counterpart
+            /// of [`saturate`][Self::saturate]. Every event must have
+            /// `top >= level`.
+            pub fn saturate_edge(
+                manager: &<Self as ::oxidd_core::function::Function>::Manager<'_>,
+                level: ::oxidd_core::LevelNo,
+                set: &Self,
+                events: &[$crate::ldd::SaturationEvent],
+                epoch: u32,
+            ) -> ::oxidd_core::util::AllocResult<Self> {
+                use ::oxidd_core::function::Function;
+                let events: Vec<_> = events
+                    .iter()
+                    .map(|event| ::oxidd_rules_ldd::SaturationEvent {
+                        relation: event.relation.as_edge(manager),
+                        meta_at_top: event.meta_at_top.as_edge(manager),
+                        top: event.top,
+                        bot: event.bot,
+                    })
+                    .collect();
+                let set = set.as_edge(manager);
+                Ok(Self(FunctionInner::from_edge(
+                    manager,
+                    FunctionInner::saturate_edge(manager, level, set, &events, epoch)?,
+                )))
             }
 
             /// Returns `true` if `self` is the empty set `∅`, i.e., contains no
@@ -431,7 +508,7 @@ mod index {
     }
     type LDD = IndexDD<LDDInfo>;
 
-    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 5);
+    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 6);
 
     crate::util::manager_ref_index_based!(pub struct LDDManagerRef(<LDD as DD>::ManagerRef) with LDDManagerData);
 
@@ -475,7 +552,7 @@ mod pointer {
     }
     type LDD = PointerDD<LDDInfo>;
 
-    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 5);
+    crate::util::manager_data!(LDDManagerData for LDD, operator: LDDOp, cache_entry_capacity: 6);
 
     crate::util::manager_ref_pointer_based!(pub struct LDDManagerRef(<LDD as DD>::ManagerRef) with LDDManagerData);
 
