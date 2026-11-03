@@ -19,6 +19,13 @@
 //! triples: `down` continues at the next level, and `right` is the next value
 //! for the same position. The spine formed by the `right` edges is sorted
 //! ascending and ends at the Empty terminal.
+//!
+//! Like the apply algorithms, saturation is generic over the recursion strategy
+//! (see [`SatRecursor`]). The independent sub-problems are the children of a
+//! node, which are saturated before the node itself, and the two halves of
+//! every step of firing an event. The node-local fixpoint itself is inherently
+//! sequential in its accumulator, but the unions and firings it performs are
+//! split as well.
 
 // spell-checker:ignore Ciardo,Marmorstein,Siminiceanu,STTT,unioned
 
@@ -29,10 +36,10 @@ use oxidd_core::util::{AllocResult, EdgeDropGuard, Own, Ref};
 use oxidd_core::{ApplyCache, InnerNode, LevelNo, Node};
 
 use crate::apply_rec::{
-    SuccessorsRecursion, apply_union, relational_successors_step, relational_successors_terminal,
-    spine,
+    SuccessorsArgs, SuccessorsRecursion, apply_union, relational_successors_step,
+    relational_successors_terminal, spine,
 };
-use crate::recursor::SequentialRecursor;
+use crate::recursor::{Recursor, SequentialRecursor};
 use crate::{
     LDDManager, LDDOp, LDDTerminal, LDDValue, SaturationEvent, collect_children, make_node, stat,
 };
@@ -45,8 +52,9 @@ use crate::{
 /// identifies `events`: calls with the same `epoch` share their cached results,
 /// so it has to differ whenever the events differ (see
 /// [`LDDFunction::saturate_edge`][crate::LDDFunction::saturate_edge]).
-pub(crate) fn saturate<M: LDDManager>(
+pub(crate) fn saturate<M: LDDManager, R: SatRecursor<M>>(
     manager: &M,
+    rec: R,
     level: LevelNo,
     q: Ref<'_, M::Edge>,
     events: &[SaturationEvent<Ref<'_, M::Edge>>],
@@ -57,24 +65,85 @@ pub(crate) fn saturate<M: LDDManager>(
         events,
         epoch,
     };
-    let mut scratch = Scratch {
-        arcs: Vec::new(),
-        frontier: Vec::new(),
-        fired: Vec::new(),
-    };
+    let mut scratch = Scratch::new();
 
-    let result = saturation.saturate_rec(&mut scratch, level, q);
-    debug_assert!(
-        scratch.arcs.is_empty() && scratch.frontier.is_empty() && scratch.fired.is_empty()
-    );
+    let result = saturation.saturate_rec(rec, &mut scratch, level, q);
+    debug_assert!(scratch.is_empty());
     result
+}
+
+/// How saturation recurses on independent sub-problems
+///
+/// This is the counterpart of [`Recursor`] for saturation: its recursive calls
+/// need the events and the [`Scratch`] buffers, so they cannot be expressed by
+/// the plain operator functions that a [`Recursor`] takes. A
+/// [`SequentialRecursor`] evaluates the sub-problems one after the other in
+/// the shared buffers, while a [parallel
+/// recursor][crate::recursor::mt::ParallelRecursor] forks them onto the
+/// worker pool, giving the forked half buffers of its own.
+pub(crate) trait SatRecursor<M: LDDManager>: Recursor<M> {
+    /// Saturates the down-branches of the first `len` entries of the spine
+    /// `spine`, which resides at `level`, and pushes the `(value, saturated
+    /// down-branch)` pairs onto `scratch.arcs` in spine order.
+    ///
+    /// If it fails, the pairs that were already pushed are left in
+    /// `scratch.arcs` for the caller to release.
+    fn saturate_children(
+        self,
+        sat: &Saturation<'_, M>,
+        scratch: &mut Scratch<M>,
+        level: LevelNo,
+        spine: Ref<'_, M::Edge>,
+        len: usize,
+    ) -> AllocResult<()>;
+
+    /// Runs [`Saturation::fire`] for `first` and `second`, which are the two
+    /// recursive calls of a step that builds a node at `node_level`.
+    fn fire_pair<'m>(
+        self,
+        manager: &'m M,
+        sat: &Saturation<'_, M>,
+        scratch: &mut Scratch<M>,
+        node_level: LevelNo,
+        first: SuccessorsArgs<'_, M>,
+        second: SuccessorsArgs<'_, M>,
+    ) -> AllocResult<(EdgeDropGuard<'m, M>, EdgeDropGuard<'m, M>)>;
+}
+
+impl<M: LDDManager> SatRecursor<M> for SequentialRecursor {
+    #[inline(always)]
+    fn saturate_children(
+        self,
+        sat: &Saturation<'_, M>,
+        scratch: &mut Scratch<M>,
+        level: LevelNo,
+        spine: Ref<'_, M::Edge>,
+        len: usize,
+    ) -> AllocResult<()> {
+        sat.saturate_children_seq(self, scratch, level, spine, len)
+    }
+
+    #[inline(always)]
+    fn fire_pair<'m>(
+        self,
+        manager: &'m M,
+        sat: &Saturation<'_, M>,
+        scratch: &mut Scratch<M>,
+        node_level: LevelNo,
+        first: SuccessorsArgs<'_, M>,
+        second: SuccessorsArgs<'_, M>,
+    ) -> AllocResult<(EdgeDropGuard<'m, M>, EdgeDropGuard<'m, M>)> {
+        let first = EdgeDropGuard::new(manager, sat.fire(self, scratch, node_level, first)?);
+        let second = EdgeDropGuard::new(manager, sat.fire(self, scratch, node_level, second)?);
+        Ok((first, second))
+    }
 }
 
 /// The information that stays the same during a whole saturation run.
 ///
 /// Keeping it in one place, rather than in the parameters of every recursive
 /// call, keeps the stack frames small.
-struct Saturation<'a, M: LDDManager> {
+pub(crate) struct Saturation<'a, M: LDDManager> {
     manager: &'a M,
     /// Every event that can be fired.
     events: &'a [SaturationEvent<Ref<'a, M::Edge>>],
@@ -90,7 +159,9 @@ struct Saturation<'a, M: LDDManager> {
 /// touches the entries above it, and truncates back to that length before
 /// returning. Nested calls therefore never observe or disturb the entries of
 /// their callers. All of them are empty again when the outermost call returns.
-struct Scratch<M: LDDManager> {
+///
+/// A sub-problem that is forked onto another thread gets buffers of its own.
+pub(crate) struct Scratch<M: LDDManager> {
     /// The accumulator of the node being saturated: its `(value,
     /// continuation)` pairs, sorted ascending by value. The continuation of a
     /// value is replaced by a bigger one whenever firing an event grows it, and
@@ -104,6 +175,20 @@ struct Scratch<M: LDDManager> {
     fired: Vec<(M::InnerNodeValue, Own<M::Edge>)>,
 }
 
+impl<M: LDDManager> Scratch<M> {
+    fn new() -> Self {
+        Scratch {
+            arcs: Vec::new(),
+            frontier: Vec::new(),
+            fired: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.arcs.is_empty() && self.frontier.is_empty() && self.fired.is_empty()
+    }
+}
+
 impl<M: LDDManager> Saturation<'_, M> {
     /// Implements [`saturate`], using (and restoring) the shared `scratch`
     /// buffers.
@@ -111,12 +196,17 @@ impl<M: LDDManager> Saturation<'_, M> {
     /// Memoized on node identity and the epoch via [`LDDOp::Saturate`]; see
     /// [`Self::saturate_node`] for the computation itself. If it fails,
     /// everything it left in `scratch` is released.
-    fn saturate_rec(
+    fn saturate_rec<R: SatRecursor<M>>(
         &self,
+        rec: R,
         scratch: &mut Scratch<M>,
         level: LevelNo,
         q: Ref<'_, M::Edge>,
     ) -> AllocResult<Own<M::Edge>> {
+        if rec.should_switch_to_sequential() {
+            return self.saturate_rec(SequentialRecursor, scratch, level, q);
+        }
+        
         let manager = self.manager;
         stat!(call LDDOp::Saturate);
 
@@ -139,7 +229,7 @@ impl<M: LDDManager> Saturation<'_, M> {
         let arcs_base = scratch.arcs.len();
         let frontier_base = scratch.frontier.len();
         let fired_base = scratch.fired.len();
-        let result = match self.saturate_node(scratch, level, q, arcs_base, frontier_base) {
+        let result = match self.saturate_node(rec, scratch, level, q, arcs_base, frontier_base) {
             Ok(result) => result,
             Err(err) => {
                 for (_, edge) in scratch.arcs.drain(arcs_base..) {
@@ -182,8 +272,9 @@ impl<M: LDDManager> Saturation<'_, M> {
     /// gives the continuations of a node that is closed under all events
     /// *below* `level`, (2) close it under the events *at* `level`, and (3)
     /// build the resulting node once.
-    fn saturate_node(
+    fn saturate_node<R: SatRecursor<M>>(
         &self,
+        rec: R,
         scratch: &mut Scratch<M>,
         level: LevelNo,
         q: Ref<'_, M::Edge>,
@@ -192,12 +283,11 @@ impl<M: LDDManager> Saturation<'_, M> {
     ) -> AllocResult<Own<M::Edge>> {
         let manager = self.manager;
 
-        // (1) Saturate every child. The spine is ascending, so the accumulator
+        // (1) Saturate every child. These are independent sub-problems, so the
+        // recursor may split them. The spine is ascending, so the accumulator
         // starts out sorted.
-        for (value, down) in spine(manager, q) {
-            let down_sat = self.saturate_rec(scratch, level + 1, down)?;
-            scratch.arcs.push((value.clone(), down_sat));
-        }
+        let len = spine(manager, q).count();
+        rec.saturate_children(self, scratch, level, q, len)?;
 
         // (2) Fixpoint over the events confined to this level (`top(e) ==
         // level`): fire every such event out of every value and unite the
@@ -225,7 +315,7 @@ impl<M: LDDManager> Saturation<'_, M> {
 
             let fired_base = scratch.fired.len();
             for event in self.events.iter().filter(|e| e.top == level) {
-                self.sat_fire_top(scratch, level, event, &i, arc_i.borrowed())?;
+                self.sat_fire_top(rec, scratch, level, event, &i, arc_i.borrowed())?;
             }
             drop(arc_i);
 
@@ -249,13 +339,8 @@ impl<M: LDDManager> Saturation<'_, M> {
                         // The union of two saturated sets is saturated (the
                         // relational image distributes over union), so no
                         // re-saturation is needed here.
-                        let unioned = apply_union(
-                            manager,
-                            SequentialRecursor,
-                            level + 1,
-                            arc_j.borrowed(),
-                            f.borrowed(),
-                        )?;
+                        let unioned =
+                            apply_union(manager, rec, level + 1, arc_j.borrowed(), f.borrowed())?;
                         if unioned == *arc_j {
                             manager.drop_edge(unioned);
                             continue;
@@ -287,6 +372,23 @@ impl<M: LDDManager> Saturation<'_, M> {
         Ok(result)
     }
 
+    /// Implements [`SatRecursor::saturate_children`] without splitting, but
+    /// still using `rec` for the children themselves.
+    fn saturate_children_seq<R: SatRecursor<M>>(
+        &self,
+        rec: R,
+        scratch: &mut Scratch<M>,
+        level: LevelNo,
+        q: Ref<'_, M::Edge>,
+        len: usize,
+    ) -> AllocResult<()> {
+        for (value, down) in spine(self.manager, q).take(len) {
+            let down_sat = self.saturate_rec(rec, scratch, level + 1, down)?;
+            scratch.arcs.push((value.clone(), down_sat));
+        }
+        Ok(())
+    }
+
     /// Fires `event`, whose `top` is `level`, the level of the node that is
     /// being saturated, out of the single value `i` of that node. The
     /// continuation of `i` is `arc_i`, and it is already saturated. Pushes the
@@ -304,8 +406,9 @@ impl<M: LDDManager> Saturation<'_, M> {
     /// below `top(e)`, saturates. Saturating here would call `saturate` for a
     /// node at this same level, while the saturation of a node at this level
     /// may still be on the call stack, which would not terminate.
-    fn sat_fire_top(
+    fn sat_fire_top<R: SatRecursor<M>>(
         &self,
+        rec: R,
         scratch: &mut Scratch<M>,
         level: LevelNo,
         event: &SaturationEvent<Ref<'_, M::Edge>>,
@@ -326,14 +429,14 @@ impl<M: LDDManager> Saturation<'_, M> {
             // Read-only: the value is unaffected; only fire if the relation has
             // an entry matching `i`.
             if let Some(rel_down) = spine_lookup(manager, event.relation, i) {
-                let f = self.sat_rec_fire(scratch, level + 1, arc_i, rel_down, meta_down)?;
+                let f = self.sat_rec_fire(rec, scratch, level + 1, arc_i, rel_down, meta_down)?;
                 self.push_fired(scratch, i, f);
             }
         } else if *meta_value == M::InnerNodeValue::WRITE_ONLY {
             // Write-only: every relation value is a possible successor, all
             // sharing `arc_i` as their (unconstrained by `i`) source.
             for (value, down) in spine(manager, event.relation) {
-                let f = self.sat_rec_fire(scratch, level + 1, arc_i, down, meta_down)?;
+                let f = self.sat_rec_fire(rec, scratch, level + 1, arc_i, down, meta_down)?;
                 self.push_fired(scratch, value, f);
             }
         } else if *meta_value == M::InnerNodeValue::READ_OF_PAIR {
@@ -346,7 +449,8 @@ impl<M: LDDManager> Saturation<'_, M> {
                 let (write_meta_down, _) = collect_children(write_meta_node);
 
                 for (value, down) in spine(manager, rel_down) {
-                    let f = self.sat_rec_fire(scratch, level + 1, arc_i, down, write_meta_down)?;
+                    let f =
+                        self.sat_rec_fire(rec, scratch, level + 1, arc_i, down, write_meta_down)?;
                     self.push_fired(scratch, value, f);
                 }
             }
@@ -380,14 +484,18 @@ impl<M: LDDManager> Saturation<'_, M> {
     /// do not always determine the result level, so it is part of the key.
     /// Only calls that end up at a new level are memoized, and those are
     /// exactly the ones that saturate.
-    fn sat_rec_fire(
+    fn sat_rec_fire<R: SatRecursor<M>>(
         &self,
+        rec: R,
         scratch: &mut Scratch<M>,
         level: LevelNo,
         q: Ref<'_, M::Edge>,
         rel: Ref<'_, M::Edge>,
         meta: Ref<'_, M::Edge>,
     ) -> AllocResult<Own<M::Edge>> {
+        if rec.should_switch_to_sequential() {
+            return self.sat_rec_fire(SequentialRecursor, scratch, level, q, rel, meta);
+        }
         let manager = self.manager;
         stat!(call LDDOp::SatRecFire);
 
@@ -415,6 +523,7 @@ impl<M: LDDManager> Saturation<'_, M> {
             &mut FireRecursion {
                 saturation: self,
                 scratch: &mut *scratch,
+                rec,
                 level,
             },
             level,
@@ -424,7 +533,7 @@ impl<M: LDDManager> Saturation<'_, M> {
             nodes,
         )?;
         let raw = EdgeDropGuard::new(manager, raw);
-        let result = self.saturate_rec(scratch, level, raw.borrowed())?;
+        let result = self.saturate_rec(rec, scratch, level, raw.borrowed())?;
 
         manager.apply_cache().add_extended(
             manager,
@@ -444,14 +553,18 @@ impl<M: LDDManager> Saturation<'_, M> {
     /// This is a linear spine walk, so it needs no cache of its own (mirroring
     /// the paper's split between `SatFire` at the top and `SatRecFire` below
     /// it).
-    fn rec_fire(
+    fn rec_fire<R: SatRecursor<M>>(
         &self,
+        rec: R,
         scratch: &mut Scratch<M>,
         level: LevelNo,
         q: Ref<'_, M::Edge>,
         rel: Ref<'_, M::Edge>,
         meta: Ref<'_, M::Edge>,
     ) -> AllocResult<Own<M::Edge>> {
+        if rec.should_switch_to_sequential() {
+            return self.rec_fire(SequentialRecursor, scratch, level, q, rel, meta);
+        }
         let manager = self.manager;
 
         // A continuation to the right may run off the end of a spine, or a
@@ -467,6 +580,7 @@ impl<M: LDDManager> Saturation<'_, M> {
             &mut FireRecursion {
                 saturation: self,
                 scratch,
+                rec,
                 level,
             },
             level,
@@ -476,23 +590,48 @@ impl<M: LDDManager> Saturation<'_, M> {
             nodes,
         )
     }
+
+    /// Computes the relational successors of `args` while firing an event, in
+    /// a step that builds a node at `node_level`: continuations that stay at
+    /// `node_level` are fired by [`Self::rec_fire`], and those that descend to
+    /// the next level by the saturating [`Self::sat_rec_fire`].
+    fn fire<R: SatRecursor<M>>(
+        &self,
+        rec: R,
+        scratch: &mut Scratch<M>,
+        node_level: LevelNo,
+        SuccessorsArgs {
+            level,
+            set,
+            rel,
+            meta,
+        }: SuccessorsArgs<'_, M>,
+    ) -> AllocResult<Own<M::Edge>> {
+        if level == node_level {
+            self.rec_fire(rec, scratch, level, set, rel, meta)
+        } else {
+            debug_assert_eq!(level, node_level + 1);
+            self.sat_rec_fire(rec, scratch, level, set, rel, meta)
+        }
+    }
 }
 
 /// The recursion of the relational successors that is used to fire events: it
 /// is the plain relational successors, except that every node that is built at
 /// a new level is saturated.
-struct FireRecursion<'s, 'a, M: LDDManager> {
+struct FireRecursion<'s, 'a, M: LDDManager, R> {
     saturation: &'s Saturation<'a, M>,
     scratch: &'s mut Scratch<M>,
+    rec: R,
     /// The level of the node built by the current step.
     level: LevelNo,
 }
 
-impl<M: LDDManager> SuccessorsRecursion<M> for FireRecursion<'_, '_, M> {
-    type Rec = SequentialRecursor;
+impl<M: LDDManager, R: SatRecursor<M>> SuccessorsRecursion<M> for FireRecursion<'_, '_, M, R> {
+    type Rec = R;
 
-    fn recursor(&self) -> SequentialRecursor {
-        SequentialRecursor
+    fn recursor(&self) -> R {
+        self.rec
     }
 
     fn recurse(
@@ -502,14 +641,33 @@ impl<M: LDDManager> SuccessorsRecursion<M> for FireRecursion<'_, '_, M> {
         rel: Ref<'_, M::Edge>,
         meta: Ref<'_, M::Edge>,
     ) -> AllocResult<Own<M::Edge>> {
-        if level == self.level {
-            self.saturation
-                .rec_fire(self.scratch, level, set, rel, meta)
-        } else {
-            debug_assert_eq!(level, self.level + 1);
-            self.saturation
-                .sat_rec_fire(self.scratch, level, set, rel, meta)
-        }
+        self.saturation.fire(
+            self.rec,
+            self.scratch,
+            self.level,
+            SuccessorsArgs {
+                level,
+                set,
+                rel,
+                meta,
+            },
+        )
+    }
+
+    fn recurse_pair<'m>(
+        &mut self,
+        manager: &'m M,
+        first: SuccessorsArgs<'_, M>,
+        second: SuccessorsArgs<'_, M>,
+    ) -> AllocResult<(EdgeDropGuard<'m, M>, EdgeDropGuard<'m, M>)> {
+        self.rec.fire_pair(
+            manager,
+            self.saturation,
+            self.scratch,
+            self.level,
+            first,
+            second,
+        )
     }
 }
 
@@ -536,4 +694,112 @@ fn spine_lookup<'a, M: LDDManager>(
 /// ascending by value.
 fn find_arc<V: Ord, E>(arcs: &[(V, E)], value: &V) -> Option<usize> {
     arcs.binary_search_by(|(v, _)| v.cmp(value)).ok()
+}
+
+/// Returns the rest of the spine of `set` after its first `n` entries.
+#[cfg(feature = "multi-threading")]
+fn spine_skip<'a, M: LDDManager>(
+    manager: &'a M,
+    mut set: Ref<'a, M::Edge>,
+    n: usize,
+) -> Ref<'a, M::Edge> {
+    for _ in 0..n {
+        let (_, right) = collect_children(manager.get_node(set).unwrap_inner());
+        set = right;
+    }
+    set
+}
+
+#[cfg(feature = "multi-threading")]
+mod mt {
+    use oxidd_core::HasWorkers;
+    use oxidd_core::LevelNo;
+    use oxidd_core::util::{AllocResult, EdgeDropGuard, Ref};
+
+    use crate::LDDManager;
+    use crate::apply_rec::SuccessorsArgs;
+    use crate::recursor::Recursor;
+    use crate::recursor::mt::ParallelRecursor;
+
+    use super::{SatRecursor, Saturation, Scratch, spine_skip};
+
+    impl<M> SatRecursor<M> for ParallelRecursor
+    where
+        M: LDDManager + HasWorkers,
+        M::Edge: Send + Sync,
+        M::InnerNodeValue: Send,
+    {
+        fn saturate_children(
+            self,
+            sat: &Saturation<'_, M>,
+            scratch: &mut Scratch<M>,
+            level: LevelNo,
+            spine: Ref<'_, M::Edge>,
+            len: usize,
+        ) -> AllocResult<()> {
+            if len < 2 || Recursor::<M>::should_switch_to_sequential(self) {
+                return sat.saturate_children_seq(self, scratch, level, spine, len);
+            }
+
+            // Split the spine in two halves. The first one pushes its pairs
+            // onto `scratch.arcs` directly, the second one onto buffers of its
+            // own, which are appended afterwards to keep the spine order.
+            let manager = sat.manager;
+            let mid = len / 2;
+            let rest = spine_skip(manager, spine, mid);
+            let (first, (second, mut second_arcs)) = self.join(
+                manager,
+                |rec| rec.saturate_children(sat, scratch, level, spine, mid),
+                |rec| {
+                    let mut scratch = Scratch::new();
+                    let result = rec.saturate_children(sat, &mut scratch, level, rest, len - mid);
+                    debug_assert!(scratch.frontier.is_empty() && scratch.fired.is_empty());
+                    (result, scratch.arcs)
+                },
+            );
+
+            if let Err(err) = first.and(second) {
+                // The caller releases the pairs of the first half.
+                for (_, edge) in second_arcs {
+                    manager.drop_edge(edge);
+                }
+                return Err(err);
+            }
+            scratch.arcs.append(&mut second_arcs);
+            Ok(())
+        }
+
+        fn fire_pair<'m>(
+            self,
+            manager: &'m M,
+            sat: &Saturation<'_, M>,
+            scratch: &mut Scratch<M>,
+            node_level: LevelNo,
+            first: SuccessorsArgs<'_, M>,
+            second: SuccessorsArgs<'_, M>,
+        ) -> AllocResult<(EdgeDropGuard<'m, M>, EdgeDropGuard<'m, M>)> {
+            if Recursor::<M>::should_switch_to_sequential(self) {
+                let first =
+                    EdgeDropGuard::new(manager, sat.fire(self, scratch, node_level, first)?);
+                let second =
+                    EdgeDropGuard::new(manager, sat.fire(self, scratch, node_level, second)?);
+                return Ok((first, second));
+            }
+
+            let (first, second) = self.join(
+                manager,
+                |rec| {
+                    let edge = sat.fire(rec, scratch, node_level, first)?;
+                    Ok(EdgeDropGuard::new(manager, edge))
+                },
+                |rec| {
+                    let mut scratch = Scratch::new();
+                    let edge = sat.fire(rec, &mut scratch, node_level, second);
+                    debug_assert!(scratch.is_empty());
+                    Ok(EdgeDropGuard::new(manager, edge?))
+                },
+            );
+            Ok((first?, second?))
+        }
+    }
 }

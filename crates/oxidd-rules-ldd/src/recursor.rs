@@ -190,6 +190,24 @@ pub mod mt {
                 remaining_depth: manager.workers().split_depth(),
             }
         }
+
+        /// Executes `op_a` and `op_b` in parallel on the worker pool of
+        /// `manager`, passing both the recursor for the next recursion depth
+        ///
+        /// This is the building block of the [`Recursor`] methods, for
+        /// recursions that cannot be expressed by a plain operator function,
+        /// e.g., because they need additional context.
+        pub fn join<M: oxidd_core::HasWorkers, RA: Send, RB: Send>(
+            mut self,
+            manager: &M,
+            op_a: impl FnOnce(Self) -> RA + Send,
+            op_b: impl FnOnce(Self) -> RB + Send,
+        ) -> (RA, RB) {
+            self.remaining_depth -= 1;
+            manager
+                .workers()
+                .join(move || op_a(self), move || op_b(self))
+        }
     }
 
     impl<M> Recursor<M> for ParallelRecursor

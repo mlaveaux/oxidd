@@ -819,10 +819,8 @@ fn saturation_event(
     })
 }
 
-#[test]
-#[cfg_attr(miri, ignore)]
-fn saturate_matches_naive() -> AllocResult<()> {
-    let mref = setup(1);
+fn saturate_matches_naive(threads: u32) -> AllocResult<()> {
+    let mref = setup(threads);
     mref.with_manager_shared(|manager| {
         let sets = representative_sets(N);
 
@@ -872,6 +870,18 @@ fn saturate_matches_naive() -> AllocResult<()> {
         }
         Ok(())
     })
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn saturate_matches_naive_t1() -> AllocResult<()> {
+    saturate_matches_naive(1)
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn saturate_matches_naive_t2() -> AllocResult<()> {
+    saturate_matches_naive(2)
 }
 
 #[test]

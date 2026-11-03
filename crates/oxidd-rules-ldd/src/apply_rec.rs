@@ -697,7 +697,7 @@ fn apply_relational_successors<M: LDDManager, R: Recursor<M>>(
 
 /// The inner nodes of the operands of [`relational_successors_step`], as
 /// returned by [`relational_successors_terminal`].
-pub(crate) struct SuccessorsNodes<'a, M: Manager> {
+pub(crate) struct Successors<'a, M: Manager> {
     /// `None` if `set` is the `True` terminal, which can only happen at a write
     /// half (see [`apply_relational_successors`]).
     set: Option<&'a M::InnerNode>,
@@ -716,7 +716,7 @@ pub(crate) fn relational_successors_terminal<'a, M: LDDManager>(
     set: Ref<'a, M::Edge>,
     rel: Ref<'a, M::Edge>,
     meta: Ref<'a, M::Edge>,
-) -> AllocResult<ControlFlow<Own<M::Edge>, SuccessorsNodes<'a, M>>> {
+) -> AllocResult<ControlFlow<Own<M::Edge>, Successors<'a, M>>> {
     // `meta` is `True` once all of its levels are consumed; the remaining
     // positions of `set` are copied unchanged. Then `rel` is `True` as well,
     // unless it is the empty relation (with no read or write positions).
@@ -754,21 +754,21 @@ pub(crate) fn relational_successors_terminal<'a, M: LDDManager>(
         }
     };
 
-    Ok(ControlFlow::Continue(SuccessorsNodes {
+    Ok(ControlFlow::Continue(Successors {
         set: set_node,
         rel: rel_node,
         meta: meta_node,
     }))
 }
 
-/// The `(level, set, rel, meta)` arguments of a recursive call of
-/// [`apply_relational_successors`].
-pub(crate) type SuccessorsArgs<'a, M> = (
-    LevelNo,
-    Ref<'a, <M as Manager>::Edge>,
-    Ref<'a, <M as Manager>::Edge>,
-    Ref<'a, <M as Manager>::Edge>,
-);
+/// The arguments of a recursive call of [`apply_relational_successors`].
+pub(crate) struct SuccessorsArgs<'a, M: Manager> {
+    /// The level at which the result resides.
+    pub(crate) level: LevelNo,
+    pub(crate) set: Ref<'a, M::Edge>,
+    pub(crate) rel: Ref<'a, M::Edge>,
+    pub(crate) meta: Ref<'a, M::Edge>,
+}
 
 /// How [`relational_successors_step`] continues after it has dealt with the
 /// current level.
@@ -804,10 +804,13 @@ pub(crate) trait SuccessorsRecursion<M: LDDManager> {
         first: SuccessorsArgs<'_, M>,
         second: SuccessorsArgs<'_, M>,
     ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
-        let first = EdgeDropGuard::new(manager, self.recurse(first.0, first.1, first.2, first.3)?);
+        let first = EdgeDropGuard::new(
+            manager,
+            self.recurse(first.level, first.set, first.rel, first.meta)?,
+        );
         let second = EdgeDropGuard::new(
             manager,
-            self.recurse(second.0, second.1, second.2, second.3)?,
+            self.recurse(second.level, second.set, second.rel, second.meta)?,
         );
         Ok((first, second))
     }
@@ -843,8 +846,12 @@ impl<M: LDDManager, R: Recursor<M>> SuccessorsRecursion<M> for CachedSuccessors<
         first: SuccessorsArgs<'_, M>,
         second: SuccessorsArgs<'_, M>,
     ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
-        self.rec
-            .ternary(apply_relational_successors, manager, first, second)
+        self.rec.ternary(
+            apply_relational_successors,
+            manager,
+            (first.level, first.set, first.rel, first.meta),
+            (second.level, second.set, second.rel, second.meta),
+        )
     }
 }
 
@@ -861,9 +868,9 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
     set: Ref<'_, M::Edge>,
     rel: Ref<'_, M::Edge>,
     meta: Ref<'_, M::Edge>,
-    nodes: SuccessorsNodes<'_, M>,
+    nodes: Successors<'_, M>,
 ) -> AllocResult<Own<M::Edge>> {
-    let SuccessorsNodes {
+    let Successors {
         set: set_node,
         rel: rel_node,
         meta: meta_node,
@@ -880,8 +887,18 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
 
         let (down_result, right_result) = recursion.recurse_pair(
             manager,
-            (level + 1, set_down, rel, meta_down),
-            (level, set_right, rel, meta),
+            SuccessorsArgs {
+                level: level + 1,
+                set: set_down,
+                rel,
+                meta: meta_down,
+            },
+            SuccessorsArgs {
+                level,
+                set: set_right,
+                rel,
+                meta,
+            },
         )?;
 
         if manager
@@ -914,8 +931,18 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
             Ordering::Equal => {
                 let (down_result, right_result) = recursion.recurse_pair(
                     manager,
-                    (level + 1, set_down, rel_down, meta_down),
-                    (level, set_right, rel_right, meta),
+                    SuccessorsArgs {
+                        level: level + 1,
+                        set: set_down,
+                        rel: rel_down,
+                        meta: meta_down,
+                    },
+                    SuccessorsArgs {
+                        level,
+                        set: set_right,
+                        rel: rel_right,
+                        meta,
+                    },
                 )?;
                 if manager
                     .get_node(down_result.borrowed())
@@ -981,8 +1008,18 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
                 // a union instead of `make_node`.
                 let (down_result, right_result) = recursion.recurse_pair(
                     manager,
-                    (level, set_down, rel_down, meta_down),
-                    (level, set_right, rel_right, meta),
+                    SuccessorsArgs {
+                        level,
+                        set: set_down,
+                        rel: rel_down,
+                        meta: meta_down,
+                    },
+                    SuccessorsArgs {
+                        level,
+                        set: set_right,
+                        rel: rel_right,
+                        meta,
+                    },
                 )?;
                 apply_union(
                     manager,
@@ -1005,8 +1042,18 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
 
         let (down_result, right_result) = recursion.recurse_pair(
             manager,
-            (level + 1, set, rel_down, meta_down),
-            (level, set, rel_right, meta),
+            SuccessorsArgs {
+                level: level + 1,
+                set,
+                rel: rel_down,
+                meta: meta_down,
+            },
+            SuccessorsArgs {
+                level,
+                set,
+                rel: rel_right,
+                meta,
+            },
         )?;
 
         if manager
@@ -1852,7 +1899,7 @@ where
         events: &[SaturationEvent<Ref<'_, EdgeOfFunc<'id, Self>>>],
         epoch: u32,
     ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
-        crate::saturate::saturate(manager, level, set, events, epoch)
+        crate::saturate::saturate(manager, SequentialRecursor, level, set, events, epoch)
     }
 }
 
@@ -2118,9 +2165,10 @@ pub mod mt {
 
         /// See [`LDDFunction::saturate_edge`].
         ///
-        /// Saturation is not parallelised yet (its node-local fixpoint is
-        /// inherently sequential in its accumulator), so this runs the same
-        /// sequential implementation regardless of the manager's worker pool.
+        /// The children of a node are saturated in parallel, and so are the
+        /// two halves of every step of firing an event. The node-local
+        /// fixpoint itself is inherently sequential in its accumulator, but
+        /// the unions and firings it performs are split as well.
         #[inline]
         pub fn saturate_edge<'id>(
             manager: &<Self as Function>::Manager<'id>,
@@ -2128,8 +2176,18 @@ pub mod mt {
             set: Ref<'_, EdgeOfFunc<'id, Self>>,
             events: &[SaturationEvent<Ref<'_, EdgeOfFunc<'id, Self>>>],
             epoch: u32,
-        ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
-            crate::saturate::saturate(manager, level, set, events, epoch)
+        ) -> AllocResult<OwnEdgeOfFunc<'id, Self>>
+        where
+            INodeValOfFunc<'id, Self>: Send,
+        {
+            crate::saturate::saturate(
+                manager,
+                ParallelRecursor::new(manager),
+                level,
+                set,
+                events,
+                epoch,
+            )
         }
     }
 }
