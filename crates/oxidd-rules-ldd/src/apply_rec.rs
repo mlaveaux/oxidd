@@ -10,7 +10,6 @@ use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
-use std::ops::ControlFlow;
 
 use oxidd_core::function::{EdgeOfFunc, Function, INodeValOfFunc, OwnEdgeOfFunc};
 use oxidd_core::util::{AllocResult, EdgeDropGuard, Own, Ref, SatCountCache, SatCountNumber};
@@ -727,65 +726,6 @@ pub(crate) fn apply_relational_successors<M: LDDManager, R: Recursor<M>>(
     }
     stat!(call LDDOp::RelationalSuccessors);
 
-    let nodes = match relational_successors_terminal(manager, set, rel, meta)? {
-        ControlFlow::Break(result) => return Ok(result),
-        ControlFlow::Continue(nodes) => nodes,
-    };
-
-    // The operands do not always determine the result level, so it is part of
-    // the key (see the function documentation).
-    stat!(cache_query LDDOp::RelationalSuccessors);
-    if let Some(([res], [])) = manager.apply_cache().get_extended(
-        manager,
-        LDDOp::RelationalSuccessors,
-        (&[set, rel, meta], &[level]),
-    ) {
-        stat!(cache_hit LDDOp::RelationalSuccessors);
-        return Ok(res);
-    }
-
-    let result = relational_successors_step(
-        manager,
-        &mut CachedSuccessors { manager, rec },
-        level,
-        set,
-        rel,
-        meta,
-        nodes,
-    )?;
-
-    manager.apply_cache().add_extended(
-        manager,
-        LDDOp::RelationalSuccessors,
-        (&[set, rel, meta], &[level]),
-        (&[result.borrowed()], &[]),
-    );
-
-    Ok(result)
-}
-
-/// The inner nodes of the operands of [`relational_successors_step`], as
-/// returned by [`relational_successors_terminal`].
-pub(crate) struct Successors<'a, M: Manager> {
-    /// `None` if `set` is the `True` terminal, which can only happen at a write
-    /// half (see [`apply_relational_successors`]).
-    set: Option<&'a M::InnerNode>,
-    rel: &'a M::InnerNode,
-    meta: &'a M::InnerNode,
-}
-
-/// Handles the cases of [`apply_relational_successors`] that need no
-/// recursion.
-///
-/// Returns [`ControlFlow::Break`] with the result if there is nothing more to
-/// do, and [`ControlFlow::Continue`] with the inner nodes of the operands
-/// otherwise.
-pub(crate) fn relational_successors_terminal<'a, M: LDDManager>(
-    manager: &'a M,
-    set: Ref<'a, M::Edge>,
-    rel: Ref<'a, M::Edge>,
-    meta: Ref<'a, M::Edge>,
-) -> AllocResult<ControlFlow<Own<M::Edge>, Successors<'a, M>>> {
     // `meta` is `True` once all of its levels are consumed; the remaining
     // positions of `set` are copied unchanged. Then `rel` is `True` as well,
     // unless it is the empty relation (with no read or write positions).
@@ -797,11 +737,9 @@ pub(crate) fn relational_successors_terminal<'a, M: LDDManager>(
                 "meta should never reach the Empty terminal"
             );
             if manager.get_node(rel).is_terminal(&LDDTerminal::Empty) {
-                return Ok(ControlFlow::Break(
-                    manager.get_terminal(LDDTerminal::Empty)?,
-                ));
+                return manager.get_terminal(LDDTerminal::Empty);
             }
-            return Ok(ControlFlow::Break(manager.clone_edge(set)));
+            return Ok(manager.clone_edge(set));
         }
         Node::Inner(n) => n,
     };
@@ -817,133 +755,22 @@ pub(crate) fn relational_successors_terminal<'a, M: LDDManager>(
                 s.is_terminal(&LDDTerminal::Empty) || r.is_terminal(&LDDTerminal::Empty),
                 "rel must have as many levels as meta"
             );
-            return Ok(ControlFlow::Break(
-                manager.get_terminal(LDDTerminal::Empty)?,
-            ));
+            return manager.get_terminal(LDDTerminal::Empty);
         }
     };
 
-    Ok(ControlFlow::Continue(Successors {
-        set: set_node,
-        rel: rel_node,
-        meta: meta_node,
-    }))
-}
-
-/// The arguments of a recursive call of [`apply_relational_successors`].
-pub(crate) struct SuccessorsArgs<'a, M: Manager> {
-    /// The level at which the result resides.
-    pub(crate) level: LevelNo,
-    pub(crate) set: Ref<'a, M::Edge>,
-    pub(crate) rel: Ref<'a, M::Edge>,
-    pub(crate) meta: Ref<'a, M::Edge>,
-}
-
-/// How [`relational_successors_step`] continues after it has dealt with the
-/// current level.
-///
-/// The step is the same for the plain relational successors
-/// ([`CachedSuccessors`]) and for firing an event during saturation, which has
-/// to saturate every node it builds at a new level (see [`crate::saturate`]).
-/// The two only differ in what a recursive call is, so that is what this trait
-/// abstracts.
-pub(crate) trait SuccessorsRecursion<M: LDDManager> {
-    /// The recursor used for the union operations of the step.
-    type Rec: Recursor<M>;
-
-    fn recursor(&self) -> Self::Rec;
-
-    /// Computes the relational successors of the given operands, where the
-    /// result resides at `level`.
-    fn recurse(
-        &mut self,
-        level: LevelNo,
-        set: Ref<'_, M::Edge>,
-        rel: Ref<'_, M::Edge>,
-        meta: Ref<'_, M::Edge>,
-    ) -> AllocResult<Own<M::Edge>>;
-
-    /// Runs [`Self::recurse`] for `first` and `second`.
-    ///
-    /// Implementations that can evaluate the two calls in parallel override
-    /// this.
-    fn recurse_pair<'a>(
-        &mut self,
-        manager: &'a M,
-        first: SuccessorsArgs<'_, M>,
-        second: SuccessorsArgs<'_, M>,
-    ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
-        let first = EdgeDropGuard::new(
-            manager,
-            self.recurse(first.level, first.set, first.rel, first.meta)?,
-        );
-        let second = EdgeDropGuard::new(
-            manager,
-            self.recurse(second.level, second.set, second.rel, second.meta)?,
-        );
-        Ok((first, second))
-    }
-}
-
-/// The recursion of [`apply_relational_successors`]: every recursive call is a
-/// cached call of it, evaluated by the recursor `rec`.
-struct CachedSuccessors<'a, M, R> {
-    manager: &'a M,
-    rec: R,
-}
-
-impl<M: LDDManager, R: Recursor<M>> SuccessorsRecursion<M> for CachedSuccessors<'_, M, R> {
-    type Rec = R;
-
-    fn recursor(&self) -> R {
-        self.rec
+    // The operands do not always determine the result level, so it is part of
+    // the key (see the function documentation).
+    stat!(cache_query LDDOp::RelationalSuccessors);
+    if let Some(([res], [])) = manager.apply_cache().get_extended(
+        manager,
+        LDDOp::RelationalSuccessors,
+        (&[set, rel, meta], &[level]),
+    ) {
+        stat!(cache_hit LDDOp::RelationalSuccessors);
+        return Ok(res);
     }
 
-    fn recurse(
-        &mut self,
-        level: LevelNo,
-        set: Ref<'_, M::Edge>,
-        rel: Ref<'_, M::Edge>,
-        meta: Ref<'_, M::Edge>,
-    ) -> AllocResult<Own<M::Edge>> {
-        apply_relational_successors(self.manager, self.rec, level, set, rel, meta)
-    }
-
-    fn recurse_pair<'a>(
-        &mut self,
-        manager: &'a M,
-        first: SuccessorsArgs<'_, M>,
-        second: SuccessorsArgs<'_, M>,
-    ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
-        self.rec.ternary(
-            apply_relational_successors,
-            manager,
-            (first.level, first.set, first.rel, first.meta),
-            (second.level, second.set, second.rel, second.meta),
-        )
-    }
-}
-
-/// Resolves the top level of the relational successors of `set` via `rel`
-/// guided by `meta`, using `recursion` for everything below it.
-///
-/// `nodes` are the inner nodes of the operands, see
-/// [`relational_successors_terminal`]. No caching is done here; see
-/// [`apply_relational_successors`] for the case analysis.
-pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M>>(
-    manager: &M,
-    recursion: &mut T,
-    level: LevelNo,
-    set: Ref<'_, M::Edge>,
-    rel: Ref<'_, M::Edge>,
-    meta: Ref<'_, M::Edge>,
-    nodes: Successors<'_, M>,
-) -> AllocResult<Own<M::Edge>> {
-    let Successors {
-        set: set_node,
-        rel: rel_node,
-        meta: meta_node,
-    } = nodes;
     let meta_value = meta_node.value();
     let (meta_down, _meta_right) = collect_children(meta_node);
 
@@ -954,20 +781,11 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
         let set_value = set_node.value();
         let (set_down, set_right) = collect_children(set_node);
 
-        let (down_result, right_result) = recursion.recurse_pair(
+        let (down_result, right_result) = rec.ternary(
+            apply_relational_successors,
             manager,
-            SuccessorsArgs {
-                level: level + 1,
-                set: set_down,
-                rel,
-                meta: meta_down,
-            },
-            SuccessorsArgs {
-                level,
-                set: set_right,
-                rel,
-                meta,
-            },
+            (level + 1, set_down, rel, meta_down),
+            (level, set_right, rel, meta),
         )?;
 
         if manager
@@ -995,23 +813,14 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
         match set_value.cmp(rel_value) {
             Ordering::Less => {
                 // `rel` does not read this value of `set`; skip it.
-                recursion.recurse(level, set_right, rel, meta)?
+                apply_relational_successors(manager, rec, level, set_right, rel, meta)?
             }
             Ordering::Equal => {
-                let (down_result, right_result) = recursion.recurse_pair(
+                let (down_result, right_result) = rec.ternary(
+                    apply_relational_successors,
                     manager,
-                    SuccessorsArgs {
-                        level: level + 1,
-                        set: set_down,
-                        rel: rel_down,
-                        meta: meta_down,
-                    },
-                    SuccessorsArgs {
-                        level,
-                        set: set_right,
-                        rel: rel_right,
-                        meta,
-                    },
+                    (level + 1, set_down, rel_down, meta_down),
+                    (level, set_right, rel_right, meta),
                 )?;
                 if manager
                     .get_node(down_result.borrowed())
@@ -1030,14 +839,13 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
             }
             Ordering::Greater => {
                 // `set` does not contain this value of `rel`; skip it.
-                recursion.recurse(level, set, rel_right, meta)?
+                apply_relational_successors(manager, rec, level, set, rel_right, meta)?
             }
         }
     } else if *meta_value == M::InnerNodeValue::WRITE_ONLY {
         // Write-only: the value of `set` is overwritten, so continue with the
         // union of all down-branches of `set`, and emit each value of `rel`.
         // The union is computed once for all values of `rel`.
-        let rec = recursion.recursor();
         let combined = {
             let mut acc = EdgeDropGuard::new(manager, manager.get_terminal(LDDTerminal::Empty)?);
             for (_, down) in spine(manager, set) {
@@ -1049,14 +857,7 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
             acc
         };
 
-        relational_successors_write_only(
-            manager,
-            recursion,
-            level,
-            combined.borrowed(),
-            rel,
-            meta_down,
-        )?
+        relational_successors_write_only(manager, rec, level, combined.borrowed(), rel, meta_down)?
     } else if *meta_value == M::InnerNodeValue::READ_OF_PAIR {
         // Read half of a pair: keep the values of `set` that also occur in
         // `rel`, but do not emit them; the write half emits the new values at
@@ -1069,30 +870,23 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
 
         match set_value.cmp(rel_value) {
             // `rel` does not read this value of `set`; skip it.
-            Ordering::Less => recursion.recurse(level, set_right, rel, meta)?,
+            Ordering::Less => {
+                apply_relational_successors(manager, rec, level, set_right, rel, meta)?
+            }
             Ordering::Equal => {
                 // `meta_down` is the write half, which stays at `level`.
                 // Different read values may write the same value, so the
                 // results of both branches can overlap and must be combined by
                 // a union instead of `make_node`.
-                let (down_result, right_result) = recursion.recurse_pair(
+                let (down_result, right_result) = rec.ternary(
+                    apply_relational_successors,
                     manager,
-                    SuccessorsArgs {
-                        level,
-                        set: set_down,
-                        rel: rel_down,
-                        meta: meta_down,
-                    },
-                    SuccessorsArgs {
-                        level,
-                        set: set_right,
-                        rel: rel_right,
-                        meta,
-                    },
+                    (level, set_down, rel_down, meta_down),
+                    (level, set_right, rel_right, meta),
                 )?;
                 apply_union(
                     manager,
-                    recursion.recursor(),
+                    rec,
                     level,
                     down_result.borrowed(),
                     right_result.borrowed(),
@@ -1100,7 +894,7 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
             }
             Ordering::Greater => {
                 // `set` does not contain this value of `rel`; skip it.
-                recursion.recurse(level, set, rel_right, meta)?
+                apply_relational_successors(manager, rec, level, set, rel_right, meta)?
             }
         }
     } else if *meta_value == M::InnerNodeValue::WRITE_OF_PAIR {
@@ -1109,20 +903,11 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
         let rel_value = rel_node.value();
         let (rel_down, rel_right) = collect_children(rel_node);
 
-        let (down_result, right_result) = recursion.recurse_pair(
+        let (down_result, right_result) = rec.ternary(
+            apply_relational_successors,
             manager,
-            SuccessorsArgs {
-                level: level + 1,
-                set,
-                rel: rel_down,
-                meta: meta_down,
-            },
-            SuccessorsArgs {
-                level,
-                set,
-                rel: rel_right,
-                meta,
-            },
+            (level + 1, set, rel_down, meta_down),
+            (level, set, rel_right, meta),
         )?;
 
         if manager
@@ -1143,22 +928,29 @@ pub(crate) fn relational_successors_step<M: LDDManager, T: SuccessorsRecursion<M
         panic!("meta has unexpected value");
     };
 
+    manager.apply_cache().add_extended(
+        manager,
+        LDDOp::RelationalSuccessors,
+        (&[set, rel, meta], &[level]),
+        (&[result.borrowed()], &[]),
+    );
+
     Ok(result)
 }
 
 /// Helper for the write-only ([`LDDValue::WRITE_ONLY`]) case of
-/// [`relational_successors_step`].
+/// [`apply_relational_successors`].
 ///
-/// Builds the LDD with a node `(v, successors(combined, rel_v_down, meta))` for
-/// every value `v` in the right spine of `rel`, where `rel_v_down` is the
-/// down-branch of the `rel` node carrying `v`, and `successors` is
-/// [`SuccessorsRecursion::recurse`]. Here `combined` is the union of all
-/// down-branches of `set`, and `combined` and `meta` are already descended past
-/// the write level. In contrast to recursing on the right sibling of `rel` in
-/// [`apply_relational_successors`], this computes `combined` only once.
-fn relational_successors_write_only<M: LDDManager, T: SuccessorsRecursion<M>>(
+/// Builds the LDD with a node `(v, apply_relational_successors(combined,
+/// rel_v_down, meta))` for every value `v` in the right spine of `rel`, where
+/// `rel_v_down` is the down-branch of the `rel` node carrying `v`. Here
+/// `combined` is the union of all down-branches of `set`, and `combined` and
+/// `meta` are already descended past the write level. In contrast to recursing
+/// on the right sibling of `rel` in [`apply_relational_successors`], this
+/// computes `combined` only once.
+fn relational_successors_write_only<M: LDDManager, R: Recursor<M>>(
     manager: &M,
-    recursion: &mut T,
+    rec: R,
     level: LevelNo,
     combined: Ref<'_, M::Edge>,
     rel: Ref<'_, M::Edge>,
@@ -1174,11 +966,11 @@ fn relational_successors_write_only<M: LDDManager, T: SuccessorsRecursion<M>>(
 
     let down_result = EdgeDropGuard::new(
         manager,
-        recursion.recurse(level + 1, combined, rel_down, meta)?,
+        apply_relational_successors(manager, rec, level + 1, combined, rel_down, meta)?,
     );
     let right_result = EdgeDropGuard::new(
         manager,
-        relational_successors_write_only(manager, recursion, level, combined, rel_right, meta)?,
+        relational_successors_write_only(manager, rec, level, combined, rel_right, meta)?,
     );
 
     if manager
