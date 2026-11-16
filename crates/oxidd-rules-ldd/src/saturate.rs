@@ -93,8 +93,8 @@ type Children<M> = Vec<(
     Own<<M as oxidd_core::Manager>::Edge>,
 )>;
 
-/// How saturation recurses on the children of a node, the independent
-/// sub-problems: one after the other, or forked onto the worker pool.
+/// How saturation recurses on the independent sub-problems: one after the
+/// other, or forked onto the worker pool.
 pub(crate) trait SatRecursor<M: LDDManager, F: ?Sized>: Recursor<M> {
     /// Saturates the first `len` children of the spine `spine` at `level + 1`.
     fn saturate_children(
@@ -104,6 +104,19 @@ pub(crate) trait SatRecursor<M: LDDManager, F: ?Sized>: Recursor<M> {
         spine: Ref<'_, M::Edge>,
         len: usize,
     ) -> AllocResult<Children<M>>;
+
+    /// Fires the events `events` of `level` on `current`, and returns
+    /// `current` united with the successors.
+    ///
+    /// Not every successor of a successor needs to be included: the caller
+    /// repeats this until nothing changes.
+    fn fire_events(
+        self,
+        sat: &Saturation<'_, M, F>,
+        level: LevelNo,
+        current: Ref<'_, M::Edge>,
+        events: &[usize],
+    ) -> AllocResult<Own<M::Edge>>;
 }
 
 impl<M, F> SatRecursor<M, F> for SequentialRecursor
@@ -119,6 +132,16 @@ where
         len: usize,
     ) -> AllocResult<Children<M>> {
         sat.saturate_children_seq(self, level, spine, len)
+    }
+
+    fn fire_events(
+        self,
+        sat: &Saturation<'_, M, F>,
+        level: LevelNo,
+        current: Ref<'_, M::Edge>,
+        events: &[usize],
+    ) -> AllocResult<Own<M::Edge>> {
+        sat.fire_events_seq(self, level, current, events)
     }
 }
 
@@ -158,14 +181,13 @@ where
         let events_here = &self.events_at[level as usize];
         if !events_here.is_empty() {
             // Fire the events of this level until nothing changes, saturating
-            // the children again after a round that grew the node. Each event
-            // fires on the result of the previous one.
+            // the children again after a round that grew the node.
             loop {
                 let before = EdgeDropGuard::new(manager, manager.clone_edge(current.borrowed()));
-                for &e in events_here {
-                    current =
-                        EdgeDropGuard::new(manager, self.fire(rec, level, current.borrowed(), e)?);
-                }
+                current = EdgeDropGuard::new(
+                    manager,
+                    rec.fire_events(self, level, current.borrowed(), events_here)?,
+                );
 
                 if current.borrowed() == before.borrowed() {
                     break;
@@ -243,6 +265,23 @@ where
         Ok(result.into_edge())
     }
 
+    /// Implements [`SatRecursor::fire_events`] without splitting: each event
+    /// fires on the result of the previous one.
+    fn fire_events_seq<R: Recursor<M>>(
+        &self,
+        rec: R,
+        level: LevelNo,
+        current: Ref<'_, M::Edge>,
+        events: &[usize],
+    ) -> AllocResult<Own<M::Edge>> {
+        let manager = self.manager;
+        let mut current = EdgeDropGuard::new(manager, manager.clone_edge(current));
+        for &e in events {
+            current = EdgeDropGuard::new(manager, self.fire(rec, level, current.borrowed(), e)?);
+        }
+        Ok(current.into_edge())
+    }
+
     /// Implements [`SatRecursor::saturate_children`] without splitting.
     fn saturate_children_seq<R: SatRecursor<M, F>>(
         &self,
@@ -272,6 +311,9 @@ mod mt {
     use oxidd_core::util::{AllocResult, Own, Ref};
     use oxidd_core::{HasWorkers, LevelNo};
 
+    use oxidd_core::util::EdgeDropGuard;
+
+    use crate::apply_rec::apply_union;
     use crate::recursor::mt::ParallelRecursor;
     use crate::recursor::{Recursor, SequentialRecursor};
     use crate::{LDDManager, collect_children};
@@ -291,9 +333,9 @@ mod mt {
         set
     }
 
-    /// Splits the children of a node in two halves that are saturated in
-    /// parallel, until the split depth is reached. The relation closure is
-    /// called from every worker, so it must be `Sync`.
+    /// Splits the children of a node, and the events of a level, in two halves
+    /// that are processed in parallel, until the split depth is reached. The
+    /// relation closure is called from every worker, so it must be `Sync`.
     impl<M, F> SatRecursor<M, F> for ParallelRecursor
     where
         M: LDDManager + HasWorkers,
@@ -339,6 +381,34 @@ mod mt {
                     Err(error)
                 }
             }
+        }
+
+        /// Fires both halves of the events on `current` (Jacobi) and unites
+        /// the results; within a half, the events fire one after the other.
+        fn fire_events(
+            self,
+            sat: &Saturation<'_, M, F>,
+            level: LevelNo,
+            current: Ref<'_, M::Edge>,
+            events: &[usize],
+        ) -> AllocResult<Own<M::Edge>> {
+            if Recursor::<M>::should_switch_to_sequential(self) {
+                return sat.fire_events_seq(SequentialRecursor, level, current, events);
+            }
+            if events.len() < 2 {
+                return sat.fire_events_seq(self, level, current, events);
+            }
+
+            let manager = sat.manager;
+            let (first, second) = events.split_at(events.len() / 2);
+            let (first, second) = self.join(
+                manager,
+                |rec| rec.fire_events(sat, level, current, first),
+                |rec| rec.fire_events(sat, level, current, second),
+            );
+            let first = EdgeDropGuard::new(manager, first?);
+            let second = EdgeDropGuard::new(manager, second?);
+            apply_union(manager, self, level, first.borrowed(), second.borrowed())
         }
     }
 }
