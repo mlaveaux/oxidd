@@ -903,3 +903,38 @@ fn saturate_reaches_fixpoint() -> AllocResult<()> {
         Ok(())
     })
 }
+
+fn union_cube_matches_naive(threads: u32) -> AllocResult<()> {
+    let mref = setup(threads);
+    mref.with_manager_shared(|manager| {
+        for set in representative_sets(N) {
+            let ldd = from_vectors(manager, &set)?;
+            for cube in all_vectors(N, 3) {
+                let result = ldd.union_cube(&cube)?;
+                let mut expected = set.clone();
+                expected.insert(cube.clone());
+                assert_eq!(to_vectors(&result), expected, "{set:?} ∪ {{{cube:?}}}");
+                assert!(result == from_vectors(manager, &expected)?);
+                if set.contains(&cube) {
+                    assert!(
+                        result == ldd,
+                        "a cube that is present leaves the set unchanged"
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn union_cube_matches_naive_t1() -> AllocResult<()> {
+    union_cube_matches_naive(1)
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn union_cube_matches_naive_t2() -> AllocResult<()> {
+    union_cube_matches_naive(2)
+}

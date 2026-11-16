@@ -31,24 +31,93 @@ fn singleton<M: LDDManager>(
     manager: &M,
     vector: &[M::InnerNodeValue],
 ) -> AllocResult<Own<M::Edge>> {
+    singleton_at(manager, 0, vector)
+}
+
+/// Return the singleton LDD of `vector` with its root at `level`.
+fn singleton_at<M: LDDManager>(
+    manager: &M,
+    level: LevelNo,
+    vector: &[M::InnerNodeValue],
+) -> AllocResult<Own<M::Edge>> {
     assert!(
-        vector.len() <= manager.num_levels() as usize,
-        "vector of length {} exceeds the {} reserved levels",
+        level as usize + vector.len() <= manager.num_levels() as usize,
+        "vector of length {} at level {level} exceeds the {} reserved levels",
         vector.len(),
         manager.num_levels()
     );
 
     let mut root = EdgeDropGuard::new(manager, manager.get_terminal(LDDTerminal::True)?);
 
-    for (level, val) in vector.iter().enumerate().rev() {
+    for (offset, val) in vector.iter().enumerate().rev() {
         let empty = manager.get_terminal(LDDTerminal::Empty)?;
         root = EdgeDropGuard::new(
             manager,
-            make_node(manager, level as LevelNo, val, root.into_edge(), empty)?,
+            make_node(
+                manager,
+                level + offset as LevelNo,
+                val,
+                root.into_edge(),
+                empty,
+            )?,
         );
     }
 
     Ok(root.into_edge())
+}
+
+/// Computes `set ∪ {cube}`, where `set` resides at `level` and its vectors have
+/// the length of `cube`.
+///
+/// Only the path of `cube` is visited: the recursion follows the spine of `set`
+/// up to the value of `cube`, and descends only into the matching value. This
+/// is sequential and never waits for the worker pool, so it can be called while
+/// a worker holds state that other work of the pool may also need. When `cube`
+/// is already in `set`, `set` itself is returned.
+fn union_cube<M: LDDManager>(
+    manager: &M,
+    level: LevelNo,
+    set: Ref<'_, M::Edge>,
+    cube: &[M::InnerNodeValue],
+) -> AllocResult<Own<M::Edge>> {
+    let Some((first, rest)) = cube.split_first() else {
+        // `set` is empty or contains only the empty vector, the vector `cube`.
+        return manager.get_terminal(LDDTerminal::True);
+    };
+
+    match manager.get_node(set) {
+        Node::Inner(node) if node.value() < first => {
+            // Keep this value, and insert `cube` further along the spine.
+            let (down, right) = collect_children(node);
+            let new_right = union_cube(manager, level, right, cube)?;
+            if new_right.borrowed() == right {
+                manager.drop_edge(new_right);
+                return Ok(manager.clone_edge(set));
+            }
+            make_node(
+                manager,
+                level,
+                node.value(),
+                manager.clone_edge(down),
+                new_right,
+            )
+        }
+        Node::Inner(node) if node.value() == first => {
+            let (down, right) = collect_children(node);
+            let new_down = union_cube(manager, level + 1, down, rest)?;
+            if new_down.borrowed() == down {
+                manager.drop_edge(new_down);
+                return Ok(manager.clone_edge(set));
+            }
+            make_node(manager, level, first, new_down, manager.clone_edge(right))
+        }
+        _ => {
+            // `set` is the Empty terminal or has a larger value, so `first`
+            // goes in front of it.
+            let down = singleton_at(manager, level + 1, rest)?;
+            make_node(manager, level, first, down, manager.clone_edge(set))
+        }
+    }
 }
 
 /// Computes the union `a ∪ b` of the two sets of vectors, both residing at
@@ -1646,6 +1715,18 @@ where
         singleton(manager, vector)
     }
 
+    /// Computes `set ∪ {cube}` for `set` at `level`, whose vectors have the
+    /// length of `cube`. Sequential: it never waits for the worker pool.
+    #[inline]
+    pub fn union_cube_edge<'id>(
+        manager: &<Self as Function>::Manager<'id>,
+        level: LevelNo,
+        set: Ref<'_, EdgeOfFunc<'id, Self>>,
+        cube: &[INodeValOfFunc<'id, Self>],
+    ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
+        union_cube(manager, level, set, cube)
+    }
+
     /// Compute the union `self ∪ other`.
     pub fn union(&self, other: &Self) -> AllocResult<Self> {
         self.with_manager_shared(|manager, a| {
@@ -1965,6 +2046,17 @@ pub mod mt {
             vector: &[INodeValOfFunc<'id, Self>],
         ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
             singleton(manager, vector)
+        }
+
+        /// See [`LDDFunction::union_cube_edge`]; also sequential here.
+        #[inline]
+        pub fn union_cube_edge<'id>(
+            manager: &<Self as Function>::Manager<'id>,
+            level: LevelNo,
+            set: Ref<'_, EdgeOfFunc<'id, Self>>,
+            cube: &[INodeValOfFunc<'id, Self>],
+        ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
+            union_cube(manager, level, set, cube)
         }
 
         /// See [`LDDFunction::union`].

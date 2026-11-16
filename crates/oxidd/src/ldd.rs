@@ -390,6 +390,25 @@ macro_rules! ldd_function_methods {
                 )))
             }
 
+            /// Returns `self ∪ {cube}`, where the vectors of `self` have the
+            /// length of `cube`.
+            ///
+            /// Only the path of `cube` is visited, sequentially, so this never
+            /// waits for the worker pool: it can be used while a worker holds
+            /// per-worker state.
+            pub fn union_cube(
+                &self,
+                cube: &[$crate::ldd::Value],
+            ) -> ::oxidd_core::util::AllocResult<Self> {
+                use ::oxidd_core::function::Function;
+                self.with_manager_shared(|manager, edge| {
+                    Ok(Self(FunctionInner::from_edge(
+                        manager,
+                        FunctionInner::union_cube_edge(manager, 0, edge, cube)?,
+                    )))
+                })
+            }
+
             /// Returns `true` if `self` is the empty set `∅`, i.e., contains no
             /// vectors.
             pub fn is_empty(&self) -> bool {
