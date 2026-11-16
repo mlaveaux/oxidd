@@ -785,28 +785,24 @@ fn naive_saturate(set: &Vectors, events: &[(Vectors, Vec<LevelNo>, Vec<LevelNo>)
     }
 }
 
-/// Builds the [`SaturationEvent`] for the relation `rel` with the given `read`
-/// and `write` positions, which must not both be empty.
+/// Builds the [`SaturationEvent`] and the relation LDD for the relation `rel`
+/// with the given `read` and `write` positions, which must not both be empty.
 fn saturation_event(
     manager: &Manager<'_>,
     rel: &Vectors,
     read: &[LevelNo],
     write: &[LevelNo],
-) -> AllocResult<SaturationEvent> {
-    let positions = || read.iter().chain(write);
-    let top = *positions().min().unwrap();
-    let bot = *positions().max().unwrap();
+) -> AllocResult<(SaturationEvent, LDDFunction)> {
+    let top = *read.iter().chain(write).min().unwrap();
 
     let mut meta_at_top = LDDFunction::relation_meta(manager, read, write)?.meta;
     for _ in 0..top {
         meta_at_top = meta_at_top.node().unwrap().1;
     }
-    Ok(SaturationEvent {
-        relation: from_vectors(manager, rel)?,
-        meta_at_top,
-        top,
-        bot,
-    })
+    Ok((
+        SaturationEvent { meta_at_top, top },
+        from_vectors(manager, rel)?,
+    ))
 }
 
 fn saturate_matches_naive(threads: u32) -> AllocResult<()> {
@@ -843,12 +839,16 @@ fn saturate_matches_naive(threads: u32) -> AllocResult<()> {
         }
 
         for (epoch, group) in groups.iter().enumerate() {
-            let ldd_events = group
+            let (events, relations): (Vec<_>, Vec<_>) = group
                 .iter()
                 .map(|(rel, read, write)| saturation_event(manager, rel, read, write))
-                .collect::<AllocResult<Vec<_>>>()?;
+                .collect::<AllocResult<Vec<_>>>()?
+                .into_iter()
+                .unzip();
             for set in &sets {
-                let result = from_vectors(manager, set)?.saturate(&ldd_events, epoch as u32)?;
+                let result =
+                    from_vectors(manager, set)?
+                        .saturate(&events, epoch as u32, |e, _| Ok(relations[e].clone()))?;
                 let expected = naive_saturate(set, group);
                 assert_eq!(
                     to_vectors(&result),
@@ -883,12 +883,15 @@ fn saturate_reaches_fixpoint() -> AllocResult<()> {
         let inc = (0..4).map(|i| vec![i, i + 1]).collect::<Vectors>();
         // Relation vectors are laid out as `[a_0, b_0, a_1]`
         let flip = Vectors::from([vec![0, 1, 4]]);
-        let events = [
+        let (events, relations): (Vec<_>, Vec<_>) = [
             saturation_event(manager, &inc, &[1], &[1])?,
             saturation_event(manager, &flip, &[0, 1], &[0])?,
-        ];
+        ]
+        .into_iter()
+        .unzip();
+        let relation = |e: usize, _: &LDDFunction| Ok(relations[e].clone());
         let init = from_vectors(manager, [[0, 0, 0]])?;
-        let result = init.saturate(&events, 0)?;
+        let result = init.saturate(&events, 0, relation)?;
 
         let expected = (0..2)
             .flat_map(|x| (0..5).map(move |c| vec![x, c, 0]))
@@ -897,11 +900,70 @@ fn saturate_reaches_fixpoint() -> AllocResult<()> {
         assert_eq!(to_vectors(&result), expected);
 
         // The same epoch reuses the cached results
-        assert!(init.saturate(&events, 0)? == result);
+        assert!(init.saturate(&events, 0, relation)? == result);
         // Without events, the set is returned unchanged
-        assert!(init.saturate(&[], 1)? == init);
+        assert!(init.saturate(&[], 1, relation)? == init);
         Ok(())
     })
+}
+
+/// A counter at position 1 that increments up to 4, whose relation is learned
+/// on the fly: for the counter values of every node it is fired on.
+fn saturate_learns_on_the_fly(threads: u32) -> AllocResult<()> {
+    let mref = setup(threads);
+    mref.with_manager_shared(|manager| {
+        let (event, _) = saturation_event(manager, &Vectors::new(), &[1], &[1])?;
+        let events = [event];
+        let learned = std::sync::Mutex::new(LDDFunction::empty_set(manager));
+        let relation = |e: usize, node: &LDDFunction| {
+            assert_eq!(e, 0);
+            let mut learned = learned.lock().unwrap();
+            let mut spine = node.clone();
+            while let Some((counter, _, right)) = spine.node() {
+                if counter < 4 {
+                    *learned = learned.union(&from_vectors(manager, [[counter, counter + 1]])?)?;
+                }
+                spine = right;
+            }
+            Ok(learned.clone())
+        };
+
+        let init = from_vectors(manager, [[0, 0], [1, 2]])?;
+        let mut epoch = 0;
+        let result = loop {
+            let before = learned.lock().unwrap().clone();
+            let result = init.saturate(&events, epoch, relation)?;
+            if *learned.lock().unwrap() == before {
+                break result;
+            }
+            epoch += 1;
+        };
+
+        let expected = (0..5)
+            .map(|c| vec![0, c])
+            .chain((2..5).map(|c| vec![1, c]))
+            .collect::<Vectors>();
+        assert_eq!(to_vectors(&result), expected);
+        // Only the transitions of the reached counter values were learned
+        let learned = learned.into_inner().unwrap();
+        assert_eq!(
+            to_vectors(&learned),
+            (0..4).map(|c| vec![c, c + 1]).collect::<Vectors>()
+        );
+        Ok(())
+    })
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn saturate_learns_on_the_fly_t1() -> AllocResult<()> {
+    saturate_learns_on_the_fly(1)
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn saturate_learns_on_the_fly_t2() -> AllocResult<()> {
+    saturate_learns_on_the_fly(2)
 }
 
 fn union_cube_matches_naive(threads: u32) -> AllocResult<()> {

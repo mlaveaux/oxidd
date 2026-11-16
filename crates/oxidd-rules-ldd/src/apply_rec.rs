@@ -714,7 +714,7 @@ fn relation_meta<M: LDDManager>(
 /// from the wrong level. This cannot happen if all sets have the same length
 /// `n`, since then `set` is only `True` at a write half for result level
 /// `n - 1`.
-fn apply_relational_successors<M: LDDManager, R: Recursor<M>>(
+pub(crate) fn apply_relational_successors<M: LDDManager, R: Recursor<M>>(
     manager: &M,
     rec: R,
     level: LevelNo,
@@ -1947,15 +1947,19 @@ where
     }
 
     /// Returns `N*(set)`, the smallest superset of `set` closed under every
-    /// event in `events`, computed by node-wise saturation rather than
-    /// whole-set fixpoint iteration.
+    /// event in `events`, computed by saturation rather than whole-set
+    /// fixpoint iteration.
     ///
-    /// > Ciardo, Marmorstein, Siminiceanu, *The saturation algorithm for
-    /// > symbolic state-space exploration*, STTT 2006.
+    /// > T. van Dijk, J. Meijer, J. van de Pol, *Multi-core on-the-fly
+    /// > saturation*, TACAS 2019.
     ///
     /// `set` must reside at `level`, and every event must have `top >= level`.
     /// The vectors in `set` may have any length, as long as it is the same for
     /// all of them and the events fit within it.
+    ///
+    /// Before event `e` fires on a node `node` at its `top` level, saturation
+    /// fires the relation returned by `relation(e, node)`. This allows learning
+    /// the relation on the fly, for the vectors of `node`.
     ///
     /// Intermediate results are memoized in the apply cache, and the key does
     /// not contain the events. `epoch` stands in for them: every call with the
@@ -1967,14 +1971,27 @@ where
     /// results. Nothing has to be swept, since entries of other epochs never
     /// match and are overwritten like any other entry.
     #[inline]
-    pub fn saturate_edge<'id>(
+    pub fn saturate_edge<'id, Rel>(
         manager: &<Self as Function>::Manager<'id>,
         level: LevelNo,
         set: Ref<'_, EdgeOfFunc<'id, Self>>,
         events: &[SaturationEvent<Ref<'_, EdgeOfFunc<'id, Self>>>],
         epoch: u32,
-    ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
-        crate::saturate::saturate(manager, SequentialRecursor, level, set, events, epoch)
+        relation: &Rel,
+    ) -> AllocResult<OwnEdgeOfFunc<'id, Self>>
+    where
+        Rel: ?Sized
+            + Fn(usize, Ref<'_, EdgeOfFunc<'id, Self>>) -> AllocResult<OwnEdgeOfFunc<'id, Self>>,
+    {
+        crate::saturate::saturate(
+            manager,
+            SequentialRecursor,
+            level,
+            set,
+            events,
+            epoch,
+            relation,
+        )
     }
 }
 
@@ -2246,19 +2263,22 @@ pub mod mt {
         /// See [`LDDFunction::saturate_edge`].
         ///
         /// The children of a node are saturated in parallel, and so are the
-        /// two halves of every step of firing an event. The node-local
-        /// fixpoint itself is inherently sequential in its accumulator, but
-        /// the unions and firings it performs are split as well.
+        /// relational products and unions that fire the events. `relation` is
+        /// called from every worker, also concurrently.
         #[inline]
-        pub fn saturate_edge<'id>(
+        pub fn saturate_edge<'id, Rel>(
             manager: &<Self as Function>::Manager<'id>,
             level: LevelNo,
             set: Ref<'_, EdgeOfFunc<'id, Self>>,
             events: &[SaturationEvent<Ref<'_, EdgeOfFunc<'id, Self>>>],
             epoch: u32,
+            relation: &Rel,
         ) -> AllocResult<OwnEdgeOfFunc<'id, Self>>
         where
-            INodeValOfFunc<'id, Self>: Send,
+            INodeValOfFunc<'id, Self>: Send + Sync,
+            Rel: ?Sized
+                + Fn(usize, Ref<'_, EdgeOfFunc<'id, Self>>) -> AllocResult<OwnEdgeOfFunc<'id, Self>>
+                + Sync,
         {
             crate::saturate::saturate(
                 manager,
@@ -2267,6 +2287,7 @@ pub mod mt {
                 set,
                 events,
                 epoch,
+                relation,
             )
         }
     }

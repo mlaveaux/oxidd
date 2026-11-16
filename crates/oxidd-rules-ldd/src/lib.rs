@@ -117,13 +117,9 @@ pub enum LDDOp {
     RelationalSuccessors,
     RelationalPredecessors,
 
-    /// Node-wise saturation (`Sat_p` in the saturation paper). The cache key
-    /// also holds the epoch, because the result depends on the events.
+    /// Saturation. The cache key also holds the epoch, because the result
+    /// depends on the relations.
     Saturate,
-    /// The recursive, node-saturating half of firing one event below its `top`
-    /// level (`SatRecFire` in the saturation paper). The cache key also holds
-    /// the epoch.
-    SatRecFire,
 }
 
 trait LDDManager:
@@ -152,21 +148,16 @@ pub struct RelationMeta<E> {
 
 /// One event (transition group) used by [`LDDFunction::saturate_edge`].
 ///
-/// `relation` is a relation and `meta_at_top` a meta-LDD as for
-/// [`LDDFunction::relational_successors`], except that `meta_at_top` must
-/// already be descended `top` times, so that its own root describes position
-/// `top`. The meta-LDD only has `skip` entries above `top`, which saturation
-/// never needs to see.
+/// `meta_at_top` is a meta-LDD as for [`LDDFunction::relational_successors`],
+/// except that it must already be descended `top` times, so that its own root
+/// describes position `top`. The meta-LDD only has `skip` entries above `top`,
+/// which saturation never needs to see. The relation of the event is provided
+/// by the `relation` closure of [`LDDFunction::saturate_edge`].
 pub struct SaturationEvent<E> {
-    /// The event's transition relation.
-    pub relation: E,
     /// The event's relation meta-LDD, descended `top` times.
     pub meta_at_top: E,
     /// First (topmost) position of the vectors that this event reads or writes.
     pub top: LevelNo,
-    /// Last (bottommost) position of the vectors that this event reads or
-    /// writes.
-    pub bot: LevelNo,
 }
 
 // --- Function Interface ------------------------------------------------------
