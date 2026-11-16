@@ -197,7 +197,8 @@ where
         e: usize,
     ) -> AllocResult<Own<M::Edge>> {
         let manager = self.manager;
-        let relation = EdgeDropGuard::new(manager, (self.relation)(e, current)?);
+        // Operations of the closure continue this recursion's split budget.
+        let relation = EdgeDropGuard::new(manager, rec.scoped(|| (self.relation)(e, current))?);
         let successors = EdgeDropGuard::new(
             manager,
             apply_relational_successors(

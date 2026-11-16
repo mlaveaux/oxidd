@@ -101,6 +101,16 @@ pub trait Recursor<M: Manager>: Copy {
     /// make sense to switch to the sequential version after, e.g., a
     /// certain recursion depth.
     fn should_switch_to_sequential(self) -> bool;
+
+    /// Runs `op` such that the operations it starts on this thread continue
+    /// this recursion: they split only as far as this recursor still may
+    ///
+    /// This is for code that is called back during an operation and starts
+    /// operations of its own, e.g., the relation closure of saturation.
+    /// Without it, every such operation would start with the full split depth
+    /// of the pool, also deep down in a recursion that already uses all
+    /// workers.
+    fn scoped<T>(self, op: impl FnOnce() -> T) -> T;
 }
 
 #[derive(Clone, Copy)]
@@ -172,6 +182,14 @@ impl<M: Manager> Recursor<M> for SequentialRecursor {
     fn should_switch_to_sequential(self) -> bool {
         false // returning true would make the algorithms diverge
     }
+
+    #[inline]
+    fn scoped<T>(self, op: impl FnOnce() -> T) -> T {
+        #[cfg(feature = "multi-threading")]
+        return mt::with_split_budget(0, op);
+        #[cfg(not(feature = "multi-threading"))]
+        op()
+    }
 }
 
 #[cfg(feature = "multi-threading")]
@@ -179,15 +197,44 @@ pub mod mt {
     use super::*;
     use oxidd_core::WorkerPool;
 
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The split budget of the operation that this thread is running a
+        /// callback of, see [`Recursor::scoped`]
+        static SPLIT_BUDGET: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// Runs `op` with the split budget of new operations on this thread
+    /// limited to `depth`
+    pub(crate) fn with_split_budget<T>(depth: u32, op: impl FnOnce() -> T) -> T {
+        /// Restores the previous budget, also when `op` panics
+        struct Restore(Option<u32>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SPLIT_BUDGET.set(self.0);
+            }
+        }
+
+        let _restore = Restore(SPLIT_BUDGET.replace(Some(depth)));
+        op()
+    }
+
     #[derive(Clone, Copy)]
     pub struct ParallelRecursor {
         remaining_depth: u32,
     }
 
     impl ParallelRecursor {
+        /// Returns a recursor with the split depth of `manager`'s pool, or
+        /// less inside [`Recursor::scoped`]
         pub fn new<M: oxidd_core::HasWorkers>(manager: &M) -> Self {
+            let depth = manager.workers().split_depth();
             Self {
-                remaining_depth: manager.workers().split_depth(),
+                remaining_depth: match SPLIT_BUDGET.get() {
+                    Some(budget) => budget.min(depth),
+                    None => depth,
+                },
             }
         }
 
@@ -303,6 +350,11 @@ pub mod mt {
         #[inline(always)]
         fn should_switch_to_sequential(self) -> bool {
             self.remaining_depth == 0
+        }
+
+        #[inline]
+        fn scoped<T>(self, op: impl FnOnce() -> T) -> T {
+            with_split_budget(self.remaining_depth, op)
         }
     }
 }
