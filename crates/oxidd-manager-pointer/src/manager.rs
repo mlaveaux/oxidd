@@ -48,6 +48,14 @@ type StoreSlab<'id, DI> = ArcSlab<
     <DI as DiagramInfo>::PageSizeInfo,
 >;
 
+/// Internal handle to an inner node stored in a [`StoreSlab`]
+type StoreHandle<'id, DI> = IntHandle<
+    'id,
+    <DI as DiagramInfo>::InnerNode<'id>,
+    StoreInner<'id, DI>,
+    <DI as DiagramInfo>::PageSizeInfo,
+>;
+
 #[repr(transparent)]
 #[must_use]
 #[derive_where(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -221,14 +229,13 @@ impl<'id, DI: DiagramInfo> Manager<'id, DI> {
     ///   last reference).
     #[inline]
     unsafe fn force_drop_edge(edge: Own<Edge<'id, DI>>) {
-        let handle: IntHandle<'id, DI::InnerNode<'id>, Self, DI::PageSizeInfo> = {
+        let handle: StoreHandle<'id, DI> = {
             let raw = edge.into_raw();
             debug_assert_eq!(raw.tag_bits(), 0);
             let ptr: NonNull<DI::InnerNode<'id>> = raw.0.cast();
-            // SAFETY: By the type invariant, `ptr` was created from an
-            // `IntHandle`, the caller ensures that the type/const arguments
-            // of `IntHandle` match. Due to lifetime restrictions the `ArcSlab`
-            // outlives the `IntHandle` we create.
+            // SAFETY: By the type invariant, `ptr` was created from a
+            // `StoreHandle`. Due to lifetime restrictions the `ArcSlab`
+            // outlives the `StoreHandle` we create.
             unsafe { IntHandle::from_raw(ptr) }
         };
         // SAFETY: `handle` is the last reference
@@ -242,13 +249,12 @@ impl<'id, DI: DiagramInfo> Manager<'id, DI> {
     /// `edge` must be untagged and point to an inner node
     #[inline(always)]
     unsafe fn drop_edge_from_unique_table(edge: Own<Edge<'id, DI>>) {
-        let handle: IntHandle<'id, DI::InnerNode<'id>, Self, DI::PageSizeInfo> = {
+        let handle: StoreHandle<'id, DI> = {
             debug_assert_eq!(edge.raw().tag_bits(), 0);
             let ptr: NonNull<DI::InnerNode<'id>> = edge.into_raw().0.cast();
-            // SAFETY: By the type invariant, `ptr` was created from an
-            // `IntHandle`, the caller ensures that the type/const arguments
-            // of `IntHandle` match. Due to lifetime restrictions the `ArcSlab`
-            // outlives the `IntHandle` we create.
+            // SAFETY: By the type invariant, `ptr` was created from a
+            // `StoreHandle`. Due to lifetime restrictions the `ArcSlab`
+            // outlives the `StoreHandle` we create.
             unsafe { IntHandle::from_raw(ptr) }
         };
         IntHandle::drop_with(handle, |node| node.drop_with(Self::drop_edge_common))
