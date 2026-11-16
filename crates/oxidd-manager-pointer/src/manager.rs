@@ -8,8 +8,8 @@ use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, align_of};
 use std::ops::Range;
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{Acquire, Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 use arcslab::{ArcSlab, ArcSlabRef, AtomicRefCounted, ExtHandle, IntHandle, PageSizeInfo};
 use derive_where::derive_where;
@@ -41,6 +41,16 @@ pub struct StoreInner<'id, DI: DiagramInfo> {
     terminal_manager: DI::TerminalManager<'id>,
     workers: oxidd_core::util::Workers,
 }
+
+// === Automatic Garbage Collection ============================================
+
+/// Node count that triggers the first automatic garbage collection, and lower
+/// bound for the later ones
+const GC_MIN_NODES: usize = 1 << 18;
+
+/// The next garbage collection is triggered once the node count reaches
+/// `GC_GROWTH_FACTOR` times the node count after the previous collection
+const GC_GROWTH_FACTOR: usize = 2;
 
 type StoreSlab<'id, DI> = ArcSlab<
     <DI as DiagramInfo>::InnerNode<'id>,
@@ -83,6 +93,9 @@ pub struct Manager<'id, DI: DiagramInfo> {
     reorder_count: u64,
     gc_ongoing: TryLock,
     reorder_gc_prepared: bool,
+    /// Node count at which the next automatic garbage collection is
+    /// triggered (`usize::MAX` while one is in progress)
+    next_gc: AtomicUsize,
 }
 
 unsafe impl<'id, DI: DiagramInfo> Send for Manager<'id, DI> {}
@@ -130,6 +143,7 @@ impl<'id, DI: DiagramInfo> StoreInner<'id, DI> {
             reorder_count: 0,
             gc_ongoing: TryLock::new(),
             reorder_gc_prepared: false,
+            next_gc: AtomicUsize::new(GC_MIN_NODES),
         });
         unsafe {
             std::ptr::write(&raw mut ((*slot).manager), data);
@@ -258,6 +272,52 @@ impl<'id, DI: DiagramInfo> Manager<'id, DI> {
             unsafe { IntHandle::from_raw(ptr) }
         };
         IntHandle::drop_with(handle, |node| node.drop_with(Self::drop_edge_common))
+    }
+}
+
+impl<'id, DI: DiagramInfo> Manager<'id, DI> {
+    /// Safe point for automatic garbage collection
+    ///
+    /// The caller must not hold any level lock or apply cache entry lock.
+    #[inline(always)]
+    fn maybe_auto_gc(&self) {
+        if self.store().num_items() >= self.next_gc.load(Relaxed) {
+            self.auto_gc();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn auto_gc(&self) {
+        // During reordering, `pre_gc()` has already been called and levels
+        // may be taken by the reordering thread, so we must not collect here.
+        if self.reorder_gc_prepared {
+            return;
+        }
+        // Claim the collection, such that only one thread runs it while the
+        // others continue.
+        let next = self.next_gc.load(Relaxed);
+        if self.store().num_items() < next
+            || self
+                .next_gc
+                .compare_exchange(next, usize::MAX, Relaxed, Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        oxidd_core::Manager::gc(self);
+        // `gc()` re-arms as well, but it returns early if another (explicit)
+        // collection is running, so make sure that `next_gc` is not left at
+        // `usize::MAX`.
+        self.rearm_gc();
+    }
+
+    /// Compute the node count for the next automatic garbage collection from
+    /// the current node count
+    fn rearm_gc(&self) {
+        let live = self.store().num_items();
+        let next = std::cmp::max(GC_MIN_NODES, live.saturating_mul(GC_GROWTH_FACTOR));
+        self.next_gc.store(next, Relaxed);
     }
 }
 
@@ -461,6 +521,29 @@ unsafe impl<'id, DI: DiagramInfo> oxidd_core::Manager for Manager<'id, DI> {
     #[inline]
     fn drop_edge(&self, edge: Own<Self::Edge>) {
         Self::drop_edge_common(edge);
+    }
+
+    /// Like the default implementation, but additionally checks whether an
+    /// automatic garbage collection is due once the level lock is released
+    #[inline]
+    fn get_or_insert(
+        &self,
+        level: LevelNo,
+        children: impl IntoIterator<Item = Own<Self::Edge>>,
+        value: Self::InnerNodeValue,
+    ) -> AllocResult<Own<Self::Edge>> {
+        let guard = oxidd_core::util::InnerNodeDropGuard::new(
+            self,
+            <DI::InnerNode<'id> as InnerNode<Self::Edge>>::new(level, children, value),
+        );
+        let res = {
+            let mut view = oxidd_core::Manager::level(self, level);
+            let node = guard.into_node();
+            // SAFETY: `node`'s level and `view`'s level match
+            unsafe { oxidd_core::LevelView::get_or_insert_unchecked(&mut view, node) }
+        }; // The level lock is released here.
+        self.maybe_auto_gc();
+        res
     }
 
     #[track_caller]
@@ -733,6 +816,7 @@ unsafe impl<'id, DI: DiagramInfo> oxidd_core::Manager for Manager<'id, DI> {
             // SAFETY: We called `pre_gc`, the garbage collection is done.
             unsafe { self.data.post_gc(self) };
         }
+        self.rearm_gc();
         self.gc_ongoing.unlock();
         guard.defuse();
         collected
@@ -1565,6 +1649,12 @@ impl<DI: DiagramInfo> oxidd_core::HasWorkers for ManagerRef<DI> {
 }
 
 /// Create a new manager
+///
+/// The pointer-based manager allocates node pages on demand, so there is no
+/// maximum capacity. Garbage collections are triggered automatically (see
+/// [`Manager::get_or_insert()`][oxidd_core::Manager::get_or_insert]) once the
+/// number of inner nodes reaches `GC_GROWTH_FACTOR` times the number of nodes
+/// that survived the previous collection, but at least `GC_MIN_NODES`.
 pub fn new_manager<DI: DiagramInfo>(
     data: DI::ManagerData<'static>,
     threads: u32,

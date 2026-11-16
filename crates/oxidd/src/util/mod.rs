@@ -244,7 +244,6 @@ macro_rules! manager_ref_pointer_based {
             /// - `apply_cache_capacity` refers to the maximum number of apply cache
             ///   entries
             /// - `threads` is the thread count for the worker pool
-            #[allow(unused_variables)]
             pub fn new_manager(
                 apply_cache_capacity: usize,
                 threads: u32,
