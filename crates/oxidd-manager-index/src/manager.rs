@@ -7,16 +7,16 @@ use std::io;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::ops::Range;
+use std::ops::{DerefMut, Range};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{Acquire, Relaxed};
 
 use crossbeam_utils::CachePadded;
 use derive_where::derive_where;
+use equivalent::Equivalent;
 use fixedbitset::FixedBitSet;
-use parking_lot::{Condvar, Mutex, MutexGuard};
-use rustc_hash::FxHasher;
+use parking_lot::{Condvar, Mutex};
 
 use oxidd_core::error::{DuplicateVarName, OutOfMemory};
 use oxidd_core::function::{EdgeOfFunc, OwnEdgeOfFunc};
@@ -29,22 +29,21 @@ use scopeguard::ScopeGuard;
 use crate::DiagramInfo;
 use crate::node::NodeBase;
 use crate::terminal_manager::TerminalManager;
+use crate::util::sharded::{
+    Entry, Shard, Sharded, ShardedGuard, Shards, ShardsIter, Table, TakenShards,
+};
 use crate::util::{Invariant, TryLock, VarLevelMap, rwlock::RwLock};
 
 #[cfg(not(feature = "hugealloc"))]
 mod huge {
     pub type Box<T> = std::boxed::Box<T>;
     pub type Vec<T> = std::vec::Vec<T>;
-
-    pub type RawTable<T> = linear_hashtbl::raw::RawTable<T, u32>;
 }
 #[cfg(feature = "hugealloc")]
 mod huge {
     use hugealloc::HugeAlloc;
     pub type Box<T> = allocator_api2::boxed::Box<T, HugeAlloc>;
     pub type Vec<T> = allocator_api2::vec::Vec<T, HugeAlloc>;
-
-    pub type RawTable<T> = linear_hashtbl::raw::RawTable<T, u32, HugeAlloc>;
 }
 
 // === Manager & Edges =========================================================
@@ -209,7 +208,7 @@ pub struct Edge<'id, DI: DiagramInfo>(
 
 #[repr(C)]
 pub struct Manager<'id, DI: DiagramInfo> {
-    unique_table: Vec<Mutex<LevelViewSet<'id, DI>>>,
+    unique_table: Vec<Level<'id, DI>>,
     var_level_map: VarLevelMap,
     var_name_map: VarNameMap,
     data: ManuallyDrop<DI::ManagerData<'id>>,
@@ -668,7 +667,7 @@ impl<'id, DI: DiagramInfo> Drop for Store<'id, DI> {
         if DI::InnerNode::<'id>::needs_drop() {
             let unique_table = std::mem::take(&mut manager.unique_table);
             for level in unique_table {
-                for edge in level.into_inner().0 {
+                for edge in level.into_inner() {
                     let borrowed = edge.borrowed();
                     // SAFETY: `edge` is untagged and points to an inner node
                     let slot_ptr = unsafe { self.inner_nodes.slot_pointer_unchecked(borrowed) };
@@ -828,6 +827,23 @@ unsafe impl<'id, DI: DiagramInfo> oxidd_core::Manager for Manager<'id, DI> {
         self.store().drop_edge(edge)
     }
 
+    /// Locks only the shard of the level that the node hashes to
+    #[inline]
+    fn get_or_insert(
+        &self,
+        level: LevelNo,
+        children: impl IntoIterator<Item = Own<Self::Edge>>,
+        value: Self::InnerNodeValue,
+    ) -> AllocResult<Own<Self::Edge>> {
+        let store = self.store();
+        let node = <DI::InnerNode<'id> as InnerNode<Self::Edge>>::new(level, children, value);
+        let entry = self.unique_table[level as usize].lock_entry(&NodeKey {
+            nodes: &store.inner_nodes,
+            node: &node,
+        });
+        get_or_insert_entry(entry, store, node)
+    }
+
     #[track_caller]
     fn try_remove_node(&self, edge: Own<Edge<'id, DI>>, level: LevelNo) -> bool {
         let edge = ManuallyDrop::new(edge);
@@ -859,7 +875,7 @@ unsafe impl<'id, DI: DiagramInfo> oxidd_core::Manager for Manager<'id, DI> {
         let Some(set) = self.unique_table.get(level as usize) else {
             return false;
         };
-        let mut set = set.lock();
+        let entry = set.lock_entry(&NodeIdKey { node, id });
 
         // Read the reference count again: Another thread may have created an
         // edge between our `node.release()` call and `set.lock()`.
@@ -869,14 +885,14 @@ unsafe impl<'id, DI: DiagramInfo> oxidd_core::Manager for Manager<'id, DI> {
             return false;
         }
 
-        let Some(edge) = set.remove(node, id) else {
+        let Entry::Occupied(entry) = entry else {
             return false;
         };
+        let edge = entry.remove();
 
         let borrowed = edge.borrowed();
         // SAFETY: `edge` is untagged and points to an inner node
         let slot_ptr = unsafe { store.inner_nodes.slot_pointer_unchecked(borrowed) };
-        std::mem::forget(edge);
 
         // SAFETY: Since `rc` is 1, this is the last reference. We use `Acquire`
         // order above and `Release` order when decrementing reference counters,
@@ -920,8 +936,7 @@ unsafe impl<'id, DI: DiagramInfo> oxidd_core::Manager for Manager<'id, DI> {
         self.data.pre_reorder(self);
         DI::ManagerData::<'id>::pre_reorder_mut(self);
 
-        self.unique_table
-            .resize_with(new_len as usize, || Mutex::new(LevelViewSet::default()));
+        self.unique_table.resize_with(new_len as usize, Level::new);
         self.var_level_map.extend(additional);
         self.var_name_map.add_unnamed(additional);
 
@@ -950,8 +965,7 @@ unsafe impl<'id, DI: DiagramInfo> oxidd_core::Manager for Manager<'id, DI> {
             // `String` panics. This way, we ensure that the manager's state
             // remains consistent.
             let new_len = this.var_name_map.len();
-            this.unique_table
-                .resize_with(new_len as usize, || Mutex::new(LevelViewSet::default()));
+            this.unique_table.resize_with(new_len as usize, Level::new);
             this.var_level_map.extend((new_len - len) as VarNo);
 
             debug_assert_eq!(new_len as usize, this.unique_table.len());
@@ -987,8 +1001,7 @@ unsafe impl<'id, DI: DiagramInfo> oxidd_core::Manager for Manager<'id, DI> {
         DI::ManagerData::<'id>::pre_reorder_mut(self);
 
         let n = map.len();
-        self.unique_table
-            .resize_with(n as usize, || Mutex::new(LevelViewSet::default()));
+        self.unique_table.resize_with(n as usize, Level::new);
         self.var_level_map.extend(n);
         self.var_name_map = map;
 
@@ -1199,31 +1212,131 @@ impl<'id, DI: DiagramInfo> oxidd_core::HasWorkers for Manager<'id, DI> {
 /// reference inner nodes.
 ///
 /// Because a [`LevelViewSet`] on its own is not sufficient to drop nodes
-/// accordingly, this will simply leak all contained edges.
-struct LevelViewSet<'id, DI: DiagramInfo>(huge::RawTable<ManuallyDrop<Own<Edge<'id, DI>>>>);
+/// accordingly, this will simply leak all contained edges. The edges are
+/// wrapped in [`ManuallyDrop`], so `Own`'s `Drop` implementation is never
+/// called on them.
+type LevelViewSet<'id, DI> = Table<UniqueEdge<'id, DI>>;
 
-#[inline]
-fn hash_node<N: NodeBase>(node: &N) -> u64 {
-    let mut hasher = FxHasher::default();
-    node.hash(&mut hasher);
-    hasher.finish()
+/// An edge stored in the unique table, see [`LevelViewSet`]
+type UniqueEdge<'id, DI> = ManuallyDrop<Own<Edge<'id, DI>>>;
+
+/// Unique table of one level, split into shards (each a [`LevelViewSet`]) by
+/// node hash. Creating a node locks only its shard; a [`LevelView`] locks all
+/// of them.
+type Level<'id, DI> = Sharded<UniqueEdge<'id, DI>>;
+
+/// All shards of a level, locked
+type LockedLevel<'a, 'id, DI> = ShardedGuard<'a, UniqueEdge<'id, DI>>;
+
+/// All shards of a level, taken out of the unique table
+type TakenLevel<'id, DI> = TakenShards<UniqueEdge<'id, DI>>;
+
+// --- Unique table keys -------------------------------------------------------
+//
+// Every key hashes like the node it identifies (i.e., like the node's `Hash`
+// implementation), such that all keys for a node agree on its hash.
+
+/// Key for the node with `children` and `value`
+struct NodeParts<'a, 'b, 'id, DI: DiagramInfo> {
+    nodes: &'a SlotSlice<'id, DI>,
+    children: &'a [Ref<'b, Edge<'id, DI>>],
+    value: &'a DI::InnerNodeValue,
 }
 
-impl<'id, DI: DiagramInfo> LevelViewSet<'id, DI> {
-    /// Get the number of nodes on this level
+impl<DI: DiagramInfo> Hash for NodeParts<'_, '_, '_, DI> {
     #[inline]
-    fn len(&self) -> usize {
-        self.0.len()
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Same as the nodes' `Hash` implementation
+        crate::util::hash_children(self.children, state);
+        self.value.hash(state);
     }
+}
 
-    /// Reserve space for `additional` nodes on this level
+impl<'id, DI: DiagramInfo> Equivalent<UniqueEdge<'id, DI>> for NodeParts<'_, '_, 'id, DI> {
     #[inline]
-    fn reserve(&mut self, additional: usize) {
-        // SAFETY: The hash table only contains untagged edges referencing inner
-        // nodes.
-        self.0.reserve(additional)
+    fn equivalent(&self, edge: &UniqueEdge<'id, DI>) -> bool {
+        // SAFETY: The unique table only contains untagged edges referencing
+        // inner nodes.
+        let node = unsafe { self.nodes.inner_node_unchecked(edge.borrowed()) };
+        node.children().len() == self.children.len()
+            && node.children().zip(self.children).all(|(a, b)| a == *b)
+            && node.value() == self.value
     }
+}
 
+/// Key for a node equal to `node`
+struct NodeKey<'a, 'id, DI: DiagramInfo> {
+    nodes: &'a SlotSlice<'id, DI>,
+    node: &'a DI::InnerNode<'id>,
+}
+
+impl<DI: DiagramInfo> Hash for NodeKey<'_, '_, DI> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.node.hash(state);
+    }
+}
+
+impl<'id, DI: DiagramInfo> Equivalent<UniqueEdge<'id, DI>> for NodeKey<'_, 'id, DI> {
+    #[inline]
+    fn equivalent(&self, edge: &UniqueEdge<'id, DI>) -> bool {
+        // SAFETY: The unique table only contains untagged edges referencing
+        // inner nodes.
+        (unsafe { self.nodes.inner_node_unchecked(edge.borrowed()) }) == self.node
+    }
+}
+
+/// Key for the node `node` with ID `id` (and not just an equal node)
+struct NodeIdKey<'a, N> {
+    node: &'a N,
+    id: u32,
+}
+
+impl<N: Hash> Hash for NodeIdKey<'_, N> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.node.hash(state);
+    }
+}
+
+impl<'id, DI: DiagramInfo, N> Equivalent<UniqueEdge<'id, DI>> for NodeIdKey<'_, N> {
+    #[inline]
+    fn equivalent(&self, edge: &UniqueEdge<'id, DI>) -> bool {
+        edge.raw().0 == self.id
+    }
+}
+
+// --- Unique table operations -------------------------------------------------
+
+/// Get an edge for `node` from `entry` (the entry of `node`)
+///
+/// If `node` is not yet present in the table, it is added to `store` and
+/// inserted into the table.
+#[inline(always)]
+fn get_or_insert_entry<'id, DI: DiagramInfo, T: DerefMut<Target = LevelViewSet<'id, DI>>>(
+    entry: Entry<T>,
+    store: &Store<'id, DI>,
+    node: DI::InnerNode<'id>,
+) -> AllocResult<Own<Edge<'id, DI>>> {
+    let node = scopeguard::guard(node, |node| store.drop_node(node));
+    match entry {
+        Entry::Occupied(entry) => {
+            drop(node);
+            let edge = entry.get().borrowed();
+            // SAFETY: All edges in the table are untagged and refer to inner
+            // nodes.
+            Ok(unsafe { store.inner_nodes.clone_edge_unchecked(edge) })
+        }
+        Entry::Vacant(entry) => {
+            let [e1, e2] = store.add_node(ScopeGuard::into_inner(node))?;
+            entry.insert(ManuallyDrop::new(e1));
+            Ok(e2)
+        }
+    }
+}
+
+/// Node-specific operations on all shards of a level, locked or taken
+impl<'id, DI: DiagramInfo, S: Shard<Elem = UniqueEdge<'id, DI>>> Shards<S> {
     #[inline]
     fn get(
         &self,
@@ -1231,21 +1344,12 @@ impl<'id, DI: DiagramInfo> LevelViewSet<'id, DI> {
         children: &[Ref<'_, Edge<'id, DI>>],
         value: &DI::InnerNodeValue,
     ) -> Option<Ref<'_, Edge<'id, DI>>> {
-        let mut hasher = FxHasher::default();
-        crate::util::hash_children(children, &mut hasher);
-        value.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        let edge = self.0.get(hash, move |edge| {
-            let edge = edge.borrowed();
-            // SAFETY: The hash table only contains untagged edges
-            // referencing inner nodes.
-            let node = unsafe { nodes.inner_node_unchecked(edge) };
-            node.children().len() == children.len()
-                && node.children().zip(children).all(|(a, b)| a == *b)
-                && node.value() == value
-        })?;
-        Some(edge.borrowed())
+        let key = NodeParts {
+            nodes,
+            children,
+            value,
+        };
+        Some(self.find(&key)?.borrowed())
     }
 
     /// Insert the given edge, assuming that the referenced node is already
@@ -1295,9 +1399,8 @@ impl<'id, DI: DiagramInfo> LevelViewSet<'id, DI> {
             node.assert_level_matches(expected_level);
         }
 
-        let hash = hash_node(node);
-        match self.0.find_or_find_insert_slot(hash, |e| e.raw() == raw) {
-            Ok(_) => {
+        match self.entry(&NodeIdKey { node, id: raw.0 }) {
+            Entry::Occupied(_) => {
                 // We need to drop `edge`. This simply amounts to decrementing
                 // the reference counter, since there is still one edge
                 // referencing `node` stored in here.
@@ -1308,11 +1411,8 @@ impl<'id, DI: DiagramInfo> LevelViewSet<'id, DI> {
 
                 false
             }
-            Err(slot) => {
-                // SAFETY: `slot` was returned by `find_or_find_insert_slot`.
-                // We have exclusive access to the hash table and did not modify
-                // it in between.
-                unsafe { self.0.insert_in_slot_unchecked(hash, slot, edge) };
+            Entry::Vacant(entry) => {
+                entry.insert(edge);
                 true
             }
         }
@@ -1328,34 +1428,11 @@ impl<'id, DI: DiagramInfo> LevelViewSet<'id, DI> {
         store: &Store<'id, DI>,
         node: DI::InnerNode<'id>,
     ) -> AllocResult<Own<Edge<'id, DI>>> {
-        let node = scopeguard::guard(node, |node| store.drop_node(node));
-        let hash = hash_node(&*node);
-        match self.0.find_or_find_insert_slot(hash, |edge| {
-            let edge = edge.borrowed();
-            // SAFETY: The hash table only contains untagged edges referencing
-            // inner nodes.
-            *(unsafe { store.inner_nodes.inner_node_unchecked(edge) }) == *node
-        }) {
-            Ok(slot) => {
-                drop(node);
-                // SAFETY: `slot` was returned by `find_or_find_insert_slot`. We
-                // have exclusive access to the hash table and did not modify it
-                // in between.
-                let edge = unsafe { self.0.get_at_slot_unchecked(slot) }.borrowed();
-                // SAFETY: All edges in the table are untagged and refer to
-                // inner nodes.
-                Ok(unsafe { store.inner_nodes.clone_edge_unchecked(edge) })
-            }
-            Err(slot) => {
-                let [e1, e2] = store.add_node(ScopeGuard::into_inner(node))?;
-                let e1 = ManuallyDrop::new(e1);
-                // SAFETY: `slot` was returned by `find_or_find_insert_slot`.
-                // We have exclusive access to the hash table and did not modify
-                // it in between.
-                unsafe { self.0.insert_in_slot_unchecked(hash, slot, e1) };
-                Ok(e2)
-            }
-        }
+        let entry = self.entry(&NodeKey {
+            nodes: &store.inner_nodes,
+            node: &node,
+        });
+        get_or_insert_entry(entry, store, node)
     }
 
     /// Perform garbage collection, i.e., remove all nodes without references
@@ -1366,7 +1443,7 @@ impl<'id, DI: DiagramInfo> LevelViewSet<'id, DI> {
     /// this).
     unsafe fn gc(&mut self, store: &Store<'id, DI>) {
         let inner_nodes = &*store.inner_nodes;
-        self.0.retain(
+        self.retain(
             |edge| {
                 let edge = edge.borrowed();
                 // SAFETY: All edges in unique tables are untagged and point to
@@ -1388,17 +1465,6 @@ impl<'id, DI: DiagramInfo> LevelViewSet<'id, DI> {
                 unsafe { store.free_slot(&mut *slot_ptr, id) };
             },
         );
-    }
-
-    /// Remove the node referenced by `node` and `node_id`
-    ///
-    /// Returns `Some(edge)` if `node` was present, `None` otherwise
-    #[inline]
-    fn remove(&mut self, node: &DI::InnerNode<'id>, node_id: u32) -> Option<Own<Edge<'id, DI>>> {
-        Some(ManuallyDrop::into_inner(
-            self.0
-                .remove_entry(hash_node(node), |e| e.raw().0 == node_id)?,
-        ))
     }
 
     /// Remove the node referenced by `edge` if it is contained in this level
@@ -1424,14 +1490,14 @@ impl<'id, DI: DiagramInfo> LevelViewSet<'id, DI> {
             return false;
         }
 
-        let Some(edge) = self.remove(node, id) else {
+        let Entry::Occupied(entry) = self.entry(&NodeIdKey { node, id }) else {
             return false;
         };
+        let edge = entry.remove();
 
         let borrowed = edge.borrowed();
         // SAFETY: `edge` is untagged and points to an inner node
         let slot_ptr = unsafe { store.inner_nodes.slot_pointer_unchecked(borrowed) };
-        std::mem::forget(edge);
 
         std::sync::atomic::fence(Acquire);
 
@@ -1443,23 +1509,10 @@ impl<'id, DI: DiagramInfo> LevelViewSet<'id, DI> {
         unsafe { store.free_slot(&mut *slot_ptr, id) };
         true
     }
-
-    /// Iterate over all edges pointing to nodes in the set
-    #[inline]
-    fn iter(&self) -> LevelViewIter<'_, 'id, DI> {
-        LevelViewIter(self.0.iter())
-    }
-}
-
-impl<DI: DiagramInfo> Default for LevelViewSet<'_, DI> {
-    #[inline]
-    fn default() -> Self {
-        Self(Default::default())
-    }
 }
 
 pub struct LevelViewIter<'a, 'id, DI: DiagramInfo>(
-    linear_hashtbl::raw::Iter<'a, ManuallyDrop<Own<Edge<'id, DI>>>, u32>,
+    ShardsIter<linear_hashtbl::raw::Iter<'a, UniqueEdge<'id, DI>, u32>>,
 );
 
 impl<'a, 'id, DI: DiagramInfo> Iterator for LevelViewIter<'a, 'id, DI> {
@@ -1494,7 +1547,7 @@ pub struct LevelView<'a, 'id, DI: DiagramInfo> {
     /// (i.e., there are no "weak" edges).
     allow_node_removal: bool,
     level: LevelNo,
-    set: MutexGuard<'a, LevelViewSet<'id, DI>>,
+    set: LockedLevel<'a, 'id, DI>,
 }
 
 unsafe impl<'a, 'id, DI: DiagramInfo> oxidd_core::LevelView<Edge<'id, DI>, DI::InnerNode<'id>>
@@ -1598,12 +1651,12 @@ unsafe impl<'a, 'id, DI: DiagramInfo> oxidd_core::LevelView<Edge<'id, DI>, DI::I
     #[inline]
     unsafe fn swap(&mut self, other: &mut Self) {
         self.var_level_map.swap_levels(self.level, other.level);
-        std::mem::swap(&mut *self.set, &mut *other.set);
+        self.set.swap(&mut other.set);
     }
 
     #[inline]
     fn iter(&self) -> Self::Iterator<'_> {
-        self.set.iter()
+        LevelViewIter(self.set.iter())
     }
 
     #[inline(always)]
@@ -1613,7 +1666,7 @@ unsafe impl<'a, 'id, DI: DiagramInfo> oxidd_core::LevelView<Edge<'id, DI>, DI::I
                 store: self.store,
                 var_level_map: self.var_level_map,
                 level: self.level,
-                set: std::mem::take(&mut self.set),
+                set: self.set.take(),
             })
         } else {
             None
@@ -1633,7 +1686,7 @@ pub struct TakenLevelView<'a, 'id, DI: DiagramInfo> {
     store: &'a Store<'id, DI>,
     var_level_map: &'a VarLevelMap,
     level: LevelNo,
-    set: LevelViewSet<'id, DI>,
+    set: TakenLevel<'id, DI>,
 }
 
 unsafe impl<'id, DI: DiagramInfo> oxidd_core::LevelView<Edge<'id, DI>, DI::InnerNode<'id>>
@@ -1736,7 +1789,7 @@ unsafe impl<'id, DI: DiagramInfo> oxidd_core::LevelView<Edge<'id, DI>, DI::Inner
 
     #[inline]
     fn iter(&self) -> Self::Iterator<'_> {
-        self.set.iter()
+        LevelViewIter(self.set.iter())
     }
 
     #[inline(always)]
@@ -1752,7 +1805,7 @@ unsafe impl<'id, DI: DiagramInfo> oxidd_core::LevelView<Edge<'id, DI>, DI::Inner
 
 impl<'id, DI: DiagramInfo> Drop for TakenLevelView<'_, 'id, DI> {
     fn drop(&mut self) {
-        for edge in self.set.0.drain() {
+        for edge in self.set.drain() {
             let edge = ManuallyDrop::into_inner(edge);
             // SAFETY: Edges in unique tables are untagged and point to inner
             // nodes.
@@ -1771,7 +1824,7 @@ pub struct LevelIter<'a, 'id, DI: DiagramInfo> {
     allow_node_removal: bool,
     level_front: LevelNo,
     level_back: LevelNo,
-    it: std::slice::Iter<'a, Mutex<LevelViewSet<'id, DI>>>,
+    it: std::slice::Iter<'a, Level<'id, DI>>,
 }
 
 impl<'a, 'id, DI: DiagramInfo> Iterator for LevelIter<'a, 'id, DI> {
@@ -1804,7 +1857,7 @@ impl<'id, DI: DiagramInfo> ExactSizeIterator for LevelIter<'_, 'id, DI> {
     }
 }
 impl<'a, 'id, DI: DiagramInfo> FusedIterator for LevelIter<'a, 'id, DI> where
-    std::slice::Iter<'a, Mutex<LevelViewSet<'id, DI>>>: FusedIterator
+    std::slice::Iter<'a, Level<'id, DI>>: FusedIterator
 {
 }
 
