@@ -1,0 +1,16 @@
+[package]
+name = "rayon-spin"
+version = "0.1.0"
+edition = "2024"
+description = "Keep idle rayon workers busy instead of sleeping, for many small fork-join operations"
+categories = ["concurrency"]
+keywords = ["rayon", "thread-pool", "spinning"]
+
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+
+[dependencies]
+rayon = "1.10"

@@ -5,9 +5,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use rayon_spin::Spinners;
+
 use crate::BroadcastContext;
 
 /// Worker thread pool
+///
+/// With more than one worker, idle workers do not go to sleep while operations
+/// run, and a worker waiting in `join` runs other work instead of sleeping, see
+/// [`rayon_spin`].
 ///
 /// Dropping it waits until every worker thread has exited, including the
 /// destructors of its thread-local state, so that no worker outlives the
@@ -16,6 +22,8 @@ use crate::BroadcastContext;
 pub struct Workers {
     pool: ManuallyDrop<rayon::ThreadPool>,
     split_depth: AtomicU32,
+    /// Keeps idle workers searching for work
+    spin: Spinners,
     /// The worker threads, joined on drop
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -119,9 +127,11 @@ impl Workers {
 
         let split_depth = AtomicU32::new(Workers::auto_split_depth(&pool));
         let threads = std::mem::take(&mut *handles.lock().unwrap_or_else(|err| err.into_inner()));
+        let spin = Spinners::new(&pool);
         Ok(Self {
             pool: ManuallyDrop::new(pool),
             split_depth,
+            spin,
             threads: Mutex::new(threads),
         })
     }
@@ -138,6 +148,7 @@ impl Workers {
 
 impl Drop for Workers {
     fn drop(&mut self) {
+        self.spin.stop();
         // SAFETY: `self.pool` is not used after this.
         unsafe { ManuallyDrop::drop(&mut self.pool) };
         // Dropping the pool only tells the workers to stop; wait until they
@@ -176,7 +187,7 @@ impl crate::WorkerPool for Workers {
 
     #[inline]
     fn install<RA: Send>(&self, op: impl FnOnce() -> RA + Send) -> RA {
-        self.pool.install(op)
+        self.spin.entered(&self.pool, || self.pool.install(op))
     }
 
     #[inline]
@@ -185,7 +196,7 @@ impl crate::WorkerPool for Workers {
         op_a: impl FnOnce() -> RA + Send,
         op_b: impl FnOnce() -> RB + Send,
     ) -> (RA, RB) {
-        self.pool.join(op_a, op_b)
+        self.spin.join(&self.pool, op_a, op_b)
     }
 
     #[inline]
