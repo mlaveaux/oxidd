@@ -346,10 +346,11 @@ macro_rules! ldd_function_methods {
             /// must fit within it. Before event `e` fires on a node `node` at
             /// its `top` level, saturation fires the relation returned by
             /// `relation(e, node)`, which may learn the relation on the fly for
-            /// the vectors of `node`. With multi-threading, `relation` is called
-            /// from the workers of the manager, also concurrently. It is called
-            /// while the manager is in use, so it must not lock the manager
-            /// exclusively.
+            /// the vectors of `node`. With the `multi-threading` feature,
+            /// `relation` is called from the workers of the manager, also
+            /// concurrently, hence [`MaybeSync`][$crate::util::MaybeSync];
+            /// without it, on the calling thread. It is called while the
+            /// manager is in use, so it must not lock the manager exclusively.
             ///
             /// Intermediate results are memoized in the apply cache, and the
             /// key does not contain the relations. `epoch` stands in for them,
@@ -362,7 +363,8 @@ macro_rules! ldd_function_methods {
                 relation: F,
             ) -> ::oxidd_core::util::AllocResult<Self>
             where
-                F: Fn(usize, &Self) -> ::oxidd_core::util::AllocResult<Self> + Sync,
+                F: Fn(usize, &Self) -> ::oxidd_core::util::AllocResult<Self>
+                    + $crate::util::MaybeSync,
             {
                 use ::oxidd_core::function::Function;
                 self.with_manager_shared(|manager, _| {
@@ -383,7 +385,8 @@ macro_rules! ldd_function_methods {
                 relation: F,
             ) -> ::oxidd_core::util::AllocResult<Self>
             where
-                F: Fn(usize, &Self) -> ::oxidd_core::util::AllocResult<Self> + Sync,
+                F: Fn(usize, &Self) -> ::oxidd_core::util::AllocResult<Self>
+                    + $crate::util::MaybeSync,
             {
                 use ::oxidd_core::{Manager, function::Function};
                 let events: Vec<_> = events

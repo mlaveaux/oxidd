@@ -10,6 +10,30 @@ pub use oxidd_core::util::{
     AllocResult, IsFloatingPoint, OptBool, Ref, Rng, SatCountCache, SatCountNumber, num,
 };
 
+/// `Sync` with the `multi-threading` feature, and implemented by every type
+/// without it
+///
+/// For values that the workers of a manager may use concurrently, e.g., a
+/// closure passed to an operation that calls it from the workers. Without
+/// multi-threading, everything runs on the calling thread and no bound is
+/// needed.
+pub trait MaybeSync: maybe_sync::Bound {}
+impl<T: ?Sized + maybe_sync::Bound> MaybeSync for T {}
+
+/// The feature-dependent part of [`MaybeSync`], sealed so that it can only be
+/// used through it
+mod maybe_sync {
+    #[cfg(feature = "multi-threading")]
+    pub trait Bound: Sync {}
+    #[cfg(feature = "multi-threading")]
+    impl<T: ?Sized + Sync> Bound for T {}
+
+    #[cfg(not(feature = "multi-threading"))]
+    pub trait Bound {}
+    #[cfg(not(feature = "multi-threading"))]
+    impl<T: ?Sized> Bound for T {}
+}
+
 // We have a few `allow(unused)` attributes here to not spam the user with
 // warnings in case no manager implementation is selected.
 
