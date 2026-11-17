@@ -2072,15 +2072,20 @@ pub mod mt {
                 + Fn(usize, Ref<'_, EdgeOfFunc<'id, Self>>) -> AllocResult<OwnEdgeOfFunc<'id, Self>>
                 + Sync,
         {
-            crate::saturate::saturate(
-                manager,
-                ParallelRecursor::new(manager),
-                level,
-                set,
-                events,
-                epoch,
-                relation,
-            )
+            let saturate = || {
+                crate::saturate::saturate(
+                    manager,
+                    ParallelRecursor::new(manager),
+                    level,
+                    set,
+                    events,
+                    epoch,
+                    relation,
+                )
+            };
+            // Enter the pool once, so that saturation and every call of
+            // `relation` run on the workers.
+            oxidd_core::WorkerPool::install(manager.workers(), saturate)
         }
     }
 }
