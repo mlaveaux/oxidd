@@ -1,6 +1,8 @@
 //! Keep idle rayon workers busy instead of sleeping
 //!
-//! This is a workaround for rayon's sleep policy, without changing rayon.
+//! This is a workaround for rayon's sleep policy, without changing rayon, used
+//! by [`Workers`][super::Workers].
+//!
 //! rayon puts a worker to sleep after 32 rounds without work, and lets a
 //! worker whose half of a `join` was stolen sleep until the thief is done.
 //! With many small fork-join operations in quick succession, as in decision
@@ -17,8 +19,6 @@
 //!
 //! Both are off for a pool with a single worker.
 
-#![warn(missing_docs)]
-
 use std::cell::UnsafeCell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
@@ -32,13 +32,13 @@ use rayon::ThreadPool;
 
 /// How long the spinners keep searching for work after the last operation
 /// ended, in microseconds
-pub const SPINNER_LINGER_US: u64 = 1000;
+const SPINNER_LINGER_US: u64 = 1000;
 
 /// Spinner jobs and [`spin_join`] for one [`ThreadPool`]
 ///
 /// Every method takes the pool that this was created for. Call
 /// [`Spinners::stop`] before dropping the pool.
-pub struct Spinners {
+pub(super) struct Spinners {
     state: Arc<State>,
 }
 
@@ -62,7 +62,7 @@ struct State {
 impl Spinners {
     /// Spinners for `pool`; with a single worker there is nobody to keep
     /// busy, so everything is off.
-    pub fn new(pool: &ThreadPool) -> Self {
+    pub(super) fn new(pool: &ThreadPool) -> Self {
         let threads = pool.current_num_threads();
         let parallel = threads > 1;
         Self {
@@ -87,7 +87,7 @@ impl Spinners {
     ///
     /// Called on a worker of `pool`, this just runs `op`.
     #[inline]
-    pub fn entered<R>(&self, pool: &ThreadPool, op: impl FnOnce() -> R) -> R {
+    pub(super) fn entered<R>(&self, pool: &ThreadPool, op: impl FnOnce() -> R) -> R {
         let state = &*self.state;
         if state.linger_ns == 0 || pool.current_thread_index().is_some() {
             return op();
@@ -103,7 +103,7 @@ impl Spinners {
     /// [`ThreadPool::join`] on `pool`, using [`spin_join`] on its workers and
     /// running with spinners when called from outside
     #[inline]
-    pub fn join<RA: Send, RB: Send>(
+    pub(super) fn join<RA: Send, RB: Send>(
         &self,
         pool: &ThreadPool,
         op_a: impl FnOnce() -> RA + Send,
@@ -116,7 +116,7 @@ impl Spinners {
     }
 
     /// Ends all spinners, call this before dropping the pool
-    pub fn stop(&self) {
+    pub(super) fn stop(&self) {
         self.state.stop.store(true, Relaxed);
     }
 
@@ -173,7 +173,7 @@ impl State {
 ///
 /// Must be called on a worker of a pool: elsewhere, [`rayon::spawn`] would
 /// use the global pool.
-pub fn spin_join<RA: Send, RB: Send>(
+fn spin_join<RA: Send, RB: Send>(
     op_a: impl FnOnce() -> RA + Send,
     op_b: impl FnOnce() -> RB + Send,
 ) -> (RA, RB) {

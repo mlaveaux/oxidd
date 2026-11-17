@@ -22,8 +22,6 @@ derive-where = "1.5"
 
 # thread pool
 rayon = { version = "1.10", optional = true }
-# keep idle workers busy instead of sleeping
-rayon-spin = { workspace = true, optional = true }
 
 [target.'cfg(all(target_family = "unix", not(miri)))'.dependencies]
 # `getrlimit()` to determine the workers' stack size
@@ -37,4 +35,4 @@ libc = { version = "0.2.191", optional = true }
 ## error. Using this feature in unoptimized builds may cause false positives.
 static-leak-check = []
 
-rayon-workers = ["dep:rayon", "dep:rayon-spin", "dep:libc"]
+rayon-workers = ["dep:rayon", "dep:libc"]

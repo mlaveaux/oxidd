@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use rayon_spin::Spinners;
+mod spin;
+
+use spin::Spinners;
 
 use crate::BroadcastContext;
 
@@ -13,7 +15,7 @@ use crate::BroadcastContext;
 ///
 /// With more than one worker, idle workers do not go to sleep while operations
 /// run, and a worker waiting in `join` runs other work instead of sleeping, see
-/// [`rayon_spin`].
+/// the `spin` module.
 ///
 /// Dropping it waits until every worker thread has exited, including the
 /// destructors of its thread-local state, so that no worker outlives the
