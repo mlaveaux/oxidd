@@ -1,13 +1,23 @@
 use std::fmt;
 use std::io;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use crate::BroadcastContext;
 
 /// Worker thread pool
+///
+/// Dropping it waits until every worker thread has exited, including the
+/// destructors of its thread-local state, so that no worker outlives the
+/// manager. Thread-affine libraries used by the workers (e.g. ones that move
+/// per-thread state to the main thread when a thread exits) rely on that.
 pub struct Workers {
-    pool: rayon::ThreadPool,
+    pool: ManuallyDrop<rayon::ThreadPool>,
     split_depth: AtomicU32,
+    /// The worker threads, joined on drop
+    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 // spell-checker:ignore rlim
@@ -83,15 +93,37 @@ impl Workers {
         static POOL_COUNTER: AtomicU64 = AtomicU64::new(0);
         let p = POOL_COUNTER.fetch_add(1, Relaxed);
 
+        let handles = Arc::new(Mutex::new(Vec::with_capacity(threads as usize)));
+        let spawned = handles.clone();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads as usize)
             .thread_name(move |i| format!("oxidd/rayon {p}-{i}"))
             .stack_size(stack_size)
+            .spawn_handler(move |thread| {
+                let mut builder = std::thread::Builder::new();
+                if let Some(name) = thread.name() {
+                    builder = builder.name(name.to_owned());
+                }
+                if let Some(stack_size) = thread.stack_size() {
+                    builder = builder.stack_size(stack_size);
+                }
+                let handle = builder.spawn(|| thread.run())?;
+                spawned
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .push(handle);
+                Ok(())
+            })
             .build()
             .map_err(WorkerBuildError)?;
 
         let split_depth = AtomicU32::new(Workers::auto_split_depth(&pool));
-        Ok(Self { pool, split_depth })
+        let threads = std::mem::take(&mut *handles.lock().unwrap_or_else(|err| err.into_inner()));
+        Ok(Self {
+            pool: ManuallyDrop::new(pool),
+            split_depth,
+            threads: Mutex::new(threads),
+        })
     }
 
     fn auto_split_depth(pool: &rayon::ThreadPool) -> u32 {
@@ -100,6 +132,25 @@ impl Workers {
             (4096 * threads).ilog2()
         } else {
             0
+        }
+    }
+}
+
+impl Drop for Workers {
+    fn drop(&mut self) {
+        // SAFETY: `self.pool` is not used after this.
+        unsafe { ManuallyDrop::drop(&mut self.pool) };
+        // Dropping the pool only tells the workers to stop; wait until they
+        // did. A worker that drops the pool itself cannot wait for itself.
+        let current = std::thread::current().id();
+        for handle in std::mem::take(
+            self.threads
+                .get_mut()
+                .unwrap_or_else(|err| err.into_inner()),
+        ) {
+            if handle.thread().id() != current {
+                let _ = handle.join();
+            }
         }
     }
 }
