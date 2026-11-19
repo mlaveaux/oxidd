@@ -179,15 +179,50 @@ pub mod mt {
     use super::*;
     use oxidd_core::WorkerPool;
 
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The remaining split depth of the forked task that this thread is
+        /// currently running, or `None` outside of any fork
+        ///
+        /// Every fork of a [`ParallelRecursor`] records its decremented depth
+        /// here, so operations started on this thread (e.g., by nested
+        /// operations or callbacks) continue counting from the remaining
+        /// budget instead of starting over with the full split depth.
+        static SPLIT_BUDGET: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// Runs `op` with the split budget of new operations on this thread set
+    /// to `depth`
+    #[inline]
+    fn with_split_budget<T>(depth: u32, op: impl FnOnce() -> T) -> T {
+        /// Restores the previous budget, also when `op` panics
+        struct Restore(Option<u32>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SPLIT_BUDGET.set(self.0);
+            }
+        }
+
+        let _restore = Restore(SPLIT_BUDGET.replace(Some(depth)));
+        op()
+    }
+
     #[derive(Clone, Copy)]
     pub struct ParallelRecursor {
         remaining_depth: u32,
     }
 
     impl ParallelRecursor {
+        /// Returns a recursor with the split depth of `manager`'s pool, or
+        /// the remaining budget when called inside a forked task
         pub fn new<M: oxidd_core::HasWorkers>(manager: &M) -> Self {
+            let depth = manager.workers().split_depth();
             Self {
-                remaining_depth: manager.workers().split_depth(),
+                remaining_depth: match SPLIT_BUDGET.get() {
+                    Some(budget) => budget.min(depth),
+                    None => depth,
+                },
             }
         }
     }
@@ -205,13 +240,14 @@ pub mod mt {
             b: (LevelNo, Ref<'_, M::Edge>, Ref<'_, M::Edge>),
         ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
             self.remaining_depth -= 1;
+            let depth = self.remaining_depth;
             let (ra, rb) = manager.workers().join(
                 move || {
-                    let edge = op(manager, self, a.0, a.1, a.2)?;
+                    let edge = with_split_budget(depth, || op(manager, self, a.0, a.1, a.2))?;
                     Ok(EdgeDropGuard::new(manager, edge))
                 },
                 move || {
-                    let edge = op(manager, self, b.0, b.1, b.2)?;
+                    let edge = with_split_budget(depth, || op(manager, self, b.0, b.1, b.2))?;
                     Ok(EdgeDropGuard::new(manager, edge))
                 },
             );
@@ -236,13 +272,14 @@ pub mod mt {
             ),
         ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
             self.remaining_depth -= 1;
+            let depth = self.remaining_depth;
             let (ra, rb) = manager.workers().join(
                 move || {
-                    let edge = op(manager, self, a.0, a.1, a.2, a.3)?;
+                    let edge = with_split_budget(depth, || op(manager, self, a.0, a.1, a.2, a.3))?;
                     Ok(EdgeDropGuard::new(manager, edge))
                 },
                 move || {
-                    let edge = op(manager, self, b.0, b.1, b.2, b.3)?;
+                    let edge = with_split_budget(depth, || op(manager, self, b.0, b.1, b.2, b.3))?;
                     Ok(EdgeDropGuard::new(manager, edge))
                 },
             );
@@ -269,13 +306,16 @@ pub mod mt {
             ),
         ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
             self.remaining_depth -= 1;
+            let depth = self.remaining_depth;
             let (ra, rb) = manager.workers().join(
                 move || {
-                    let edge = op(manager, self, a.0, a.1, a.2, a.3, a.4)?;
+                    let edge =
+                        with_split_budget(depth, || op(manager, self, a.0, a.1, a.2, a.3, a.4))?;
                     Ok(EdgeDropGuard::new(manager, edge))
                 },
                 move || {
-                    let edge = op(manager, self, b.0, b.1, b.2, b.3, b.4)?;
+                    let edge =
+                        with_split_budget(depth, || op(manager, self, b.0, b.1, b.2, b.3, b.4))?;
                     Ok(EdgeDropGuard::new(manager, edge))
                 },
             );
