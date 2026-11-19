@@ -36,3 +36,7 @@ codegen-units = 1
 [profile.release-with-debug]
 inherits = "release"
 debug = "limited"
+
+# rayon-core with an opt-in idle spin before workers sleep (rayon-rs/rayon#1335).
+[patch.crates-io]
+rayon-core = { git = "https://github.com/mlaveaux/rayon", rev = "5c5cbb1f2eba6e77b6ae743b5dabb12400da8125" }

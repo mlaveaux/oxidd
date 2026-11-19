@@ -1,6 +1,7 @@
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::time::Duration;
 
 use crate::BroadcastContext;
 
@@ -87,6 +88,7 @@ impl Workers {
             .num_threads(threads as usize)
             .thread_name(move |i| format!("oxidd/rayon {p}-{i}"))
             .stack_size(stack_size)
+            .idle_spin_timeout(IDLE_SPIN_TIMEOUT)
             .build()
             .map_err(WorkerBuildError)?;
 
@@ -103,6 +105,9 @@ impl Workers {
         }
     }
 }
+
+/// How long an idle worker spins (looking for work) before it goes to sleep.
+const IDLE_SPIN_TIMEOUT: Duration = Duration::from_millis(1);
 
 impl crate::WorkerPool for Workers {
     #[inline]
