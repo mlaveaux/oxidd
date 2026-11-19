@@ -4,19 +4,22 @@
 //! [`Recursor`], which determines whether independent sub-problems are solved
 //! sequentially or split onto a worker pool (see [`crate::recursor`]).
 
+// spell-checker:ignore Ciardo,Marmorstein,Siminiceanu,STTT
+
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use oxidd_core::function::{EdgeOfFunc, Function, INodeValOfFunc, OwnEdgeOfFunc};
-use oxidd_core::util::{AllocResult, EdgeDropGuard, Own, Ref};
+use oxidd_core::util::{AllocResult, EdgeDropGuard, Own, Ref, SatCountCache, SatCountNumber};
 use oxidd_core::{ApplyCache, InnerNode, LevelNo, Manager, Node, NodeID};
 use oxidd_derive::Function;
 
 use crate::recursor::{Recursor, SequentialRecursor};
 use crate::{
-    LDDManager, LDDOp, LDDTerminal, LDDValue, RIGHT, RelationMeta, collect_children, make_node,
-    stat,
+    LDDManager, LDDOp, LDDTerminal, LDDValue, RIGHT, RelationMeta, SaturationEvent,
+    collect_children, make_node, stat,
 };
 
 /// Return a singleton LDD that contains only the list represented by `vector`.
@@ -27,29 +30,98 @@ fn singleton<M: LDDManager>(
     manager: &M,
     vector: &[M::InnerNodeValue],
 ) -> AllocResult<Own<M::Edge>> {
+    singleton_at(manager, 0, vector)
+}
+
+/// Return the singleton LDD of `vector` with its root at `level`.
+fn singleton_at<M: LDDManager>(
+    manager: &M,
+    level: LevelNo,
+    vector: &[M::InnerNodeValue],
+) -> AllocResult<Own<M::Edge>> {
     assert!(
-        vector.len() <= manager.num_levels() as usize,
-        "vector of length {} exceeds the {} reserved levels",
+        level as usize + vector.len() <= manager.num_levels() as usize,
+        "vector of length {} at level {level} exceeds the {} reserved levels",
         vector.len(),
         manager.num_levels()
     );
 
     let mut root = EdgeDropGuard::new(manager, manager.get_terminal(LDDTerminal::True)?);
 
-    for (level, val) in vector.iter().enumerate().rev() {
+    for (offset, val) in vector.iter().enumerate().rev() {
         let empty = manager.get_terminal(LDDTerminal::Empty)?;
         root = EdgeDropGuard::new(
             manager,
-            make_node(manager, level as LevelNo, val, root.into_edge(), empty)?,
+            make_node(
+                manager,
+                level + offset as LevelNo,
+                val,
+                root.into_edge(),
+                empty,
+            )?,
         );
     }
 
     Ok(root.into_edge())
 }
 
+/// Computes `set ∪ {cube}`, where `set` resides at `level` and its vectors have
+/// the length of `cube`.
+///
+/// Only the path of `cube` is visited: the recursion follows the spine of `set`
+/// up to the value of `cube`, and descends only into the matching value. This
+/// is sequential and never waits for the worker pool, so it can be called while
+/// a worker holds state that other work of the pool may also need. When `cube`
+/// is already in `set`, `set` itself is returned.
+fn union_cube<M: LDDManager>(
+    manager: &M,
+    level: LevelNo,
+    set: Ref<'_, M::Edge>,
+    cube: &[M::InnerNodeValue],
+) -> AllocResult<Own<M::Edge>> {
+    let Some((first, rest)) = cube.split_first() else {
+        // `set` is empty or contains only the empty vector, the vector `cube`.
+        return manager.get_terminal(LDDTerminal::True);
+    };
+
+    match manager.get_node(set) {
+        Node::Inner(node) if node.value() < first => {
+            // Keep this value, and insert `cube` further along the spine.
+            let (down, right) = collect_children(node);
+            let new_right = union_cube(manager, level, right, cube)?;
+            if new_right.borrowed() == right {
+                manager.drop_edge(new_right);
+                return Ok(manager.clone_edge(set));
+            }
+            make_node(
+                manager,
+                level,
+                node.value(),
+                manager.clone_edge(down),
+                new_right,
+            )
+        }
+        Node::Inner(node) if node.value() == first => {
+            let (down, right) = collect_children(node);
+            let new_down = union_cube(manager, level + 1, down, rest)?;
+            if new_down.borrowed() == down {
+                manager.drop_edge(new_down);
+                return Ok(manager.clone_edge(set));
+            }
+            make_node(manager, level, first, new_down, manager.clone_edge(right))
+        }
+        _ => {
+            // `set` is the Empty terminal or has a larger value, so `first`
+            // goes in front of it.
+            let down = singleton_at(manager, level + 1, rest)?;
+            make_node(manager, level, first, down, manager.clone_edge(set))
+        }
+    }
+}
+
 /// Computes the union `a ∪ b` of the two sets of vectors, both residing at
 /// `level`.
-fn apply_union<M: LDDManager, R: Recursor<M>>(
+pub(crate) fn apply_union<M: LDDManager, R: Recursor<M>>(
     manager: &M,
     rec: R,
     level: LevelNo,
@@ -321,8 +393,8 @@ fn apply_difference<M: LDDManager, R: Recursor<M>>(
     Ok(result)
 }
 
-/// Computes a meta LDD that is suitable for the [`project()`] function from the
-/// given projection indices.
+/// Computes a meta LDD that is suitable for the [`apply_project()`] function
+/// from the given projection indices.
 ///
 /// This function is useful to be able to cache the projection LDD instead of
 /// computing it from the projection array every time.
@@ -496,7 +568,7 @@ fn apply_project<M: LDDManager, R: Recursor<M>>(
 ///       [false]                        otherwise (not in the relation)
 /// ```
 ///
-/// Here `read_only` stands for [`LDDValue::read_only_value`], and similarly for
+/// Here `read_only` stands for [`LDDValue::READ_ONLY`], and similarly for
 /// the other names. A position in `R ∩ W` is a read+write pair, which occupies
 /// two levels of the meta-LDD: its *read half* and its *write half*.
 ///
@@ -641,7 +713,7 @@ fn relation_meta<M: LDDManager>(
 /// from the wrong level. This cannot happen if all sets have the same length
 /// `n`, since then `set` is only `True` at a write half for result level
 /// `n - 1`.
-fn apply_relational_successors<M: LDDManager, R: Recursor<M>>(
+pub(crate) fn apply_relational_successors<M: LDDManager, R: Recursor<M>>(
     manager: &M,
     rec: R,
     level: LevelNo,
@@ -776,20 +848,11 @@ fn apply_relational_successors<M: LDDManager, R: Recursor<M>>(
         // The union is computed once for all values of `rel`.
         let combined = {
             let mut acc = EdgeDropGuard::new(manager, manager.get_terminal(LDDTerminal::Empty)?);
-            let mut cur = set;
-            loop {
-                let cur_node = manager.get_node(cur).unwrap_inner();
-                let (cur_down, cur_right) = collect_children(cur_node);
-
-                let new_acc = EdgeDropGuard::new(
+            for (_, down) in spine(manager, set) {
+                acc = EdgeDropGuard::new(
                     manager,
-                    apply_union(manager, rec, level + 1, acc.borrowed(), cur_down)?,
+                    apply_union(manager, rec, level + 1, acc.borrowed(), down)?,
                 );
-                acc = new_acc;
-                if manager.get_node(cur_right).is_terminal(&LDDTerminal::Empty) {
-                    break;
-                }
-                cur = cur_right;
             }
             acc
         };
@@ -875,8 +938,8 @@ fn apply_relational_successors<M: LDDManager, R: Recursor<M>>(
     Ok(result)
 }
 
-/// Helper for the write-only ([`write_only_value`][LDDValue::write_only_value])
-/// case of [`apply_relational_successors`].
+/// Helper for the write-only ([`LDDValue::WRITE_ONLY`]) case of
+/// [`apply_relational_successors`].
 ///
 /// Builds the LDD with a node `(v, apply_relational_successors(combined,
 /// rel_v_down, meta))` for every value `v` in the right spine of `rel`, where
@@ -923,6 +986,33 @@ fn relational_successors_write_only<M: LDDManager, R: Recursor<M>>(
             down_result.into_edge(),
             right_result.into_edge(),
         )
+    }
+}
+
+/// Iterates over the `(value, down)` entries of the right spine of `set` in
+/// ascending order of value, without changing any reference counts. The
+/// iterator is empty if `set` is a terminal.
+pub(crate) fn spine<'a, M: LDDManager>(manager: &'a M, set: Ref<'a, M::Edge>) -> Spine<'a, M> {
+    Spine { manager, cur: set }
+}
+
+/// Iterator returned by [`spine()`]
+pub(crate) struct Spine<'a, M: LDDManager> {
+    manager: &'a M,
+    cur: Ref<'a, M::Edge>,
+}
+
+impl<'a, M: LDDManager> Iterator for Spine<'a, M> {
+    type Item = (&'a M::InnerNodeValue, Ref<'a, M::Edge>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // A spine ends at the Empty terminal.
+        let Node::Inner(node) = self.manager.get_node(self.cur) else {
+            return None;
+        };
+        let (down, right) = collect_children(node);
+        self.cur = right;
+        Some((node.value(), down))
     }
 }
 
@@ -1269,7 +1359,7 @@ fn apply_relational_predecessors<M: LDDManager, R: Recursor<M>>(
     Ok(result)
 }
 
-/// Helper for the write-only ([`write_only_value`][LDDValue::write_only_value])
+/// Helper for the write-only ([`LDDValue::WRITE_ONLY`])
 /// case of [`apply_relational_predecessors`].
 ///
 /// Builds the union over every value `v` in `universe` of the source node
@@ -1325,28 +1415,32 @@ fn relational_predecessors_universe<M: LDDManager, R: Recursor<M>>(
 /// containing only the empty vector (the `True` terminal) contains exactly
 /// one. The counts of inner nodes are memoized in `cache` (keyed by
 /// [`NodeID`]) so that shared sub-diagrams are only counted once.
-fn len<M: LDDManager>(
+///
+/// The count is accumulated in `N`, so it does not overflow for number types
+/// that are big enough (the same as for the satisfiability count of the Boolean
+/// function types). Only `0`, `1` and additions are used.
+fn len<M: LDDManager, N: SatCountNumber, S: BuildHasher>(
     manager: &M,
     set: Ref<'_, M::Edge>,
-    cache: &mut HashMap<NodeID, usize>,
-) -> usize {
+    cache: &mut HashMap<NodeID, N, S>,
+) -> N {
     let set_node = match manager.get_node(set) {
-        Node::Terminal(t) => return *t.borrow() as usize,
+        Node::Terminal(t) => return N::from(*t.borrow() as u32),
         Node::Inner(n) => n,
     };
 
     let node_id = set.node_id();
     if let Some(n) = cache.get(&node_id) {
-        return *n;
+        return n.clone();
     }
 
     // Walk the right spine, summing the sizes of all down-branches. The right
     // spine is terminated by the Empty terminal.
-    let mut result = 0;
+    let mut result = N::from(0);
     let mut current = set_node;
     loop {
         let (down, right) = collect_children(current);
-        result += len(manager, down, cache);
+        result = result + len(manager, down, cache);
         match manager.get_node(right) {
             Node::Inner(n) => current = n,
             Node::Terminal(t) => {
@@ -1356,7 +1450,7 @@ fn len<M: LDDManager>(
         }
     }
 
-    cache.insert(node_id, result);
+    cache.insert(node_id, result.clone());
     result
 }
 
@@ -1411,6 +1505,18 @@ where
         vector: &[INodeValOfFunc<'id, Self>],
     ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
         singleton(manager, vector)
+    }
+
+    /// Computes `set ∪ {cube}` for `set` at `level`, whose vectors have the
+    /// length of `cube`. Sequential: it never waits for the worker pool.
+    #[inline]
+    pub fn union_cube_edge<'id>(
+        manager: &<Self as Function>::Manager<'id>,
+        level: LevelNo,
+        set: Ref<'_, EdgeOfFunc<'id, Self>>,
+        cube: &[INodeValOfFunc<'id, Self>],
+    ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
+        union_cube(manager, level, set, cube)
     }
 
     /// Compute the union `self ∪ other`.
@@ -1600,19 +1706,29 @@ where
         apply_relational_predecessors(manager, SequentialRecursor, level, set, rel, meta, universe)
     }
 
-    /// Returns the number of vectors (lists) contained in `self`.
-    pub fn len(&self) -> usize {
-        self.with_manager_shared(|manager, set| Self::len_edge(manager, set))
+    /// Returns the number of vectors (lists) contained in `self`, see
+    /// [`len_edge`][Self::len_edge].
+    pub fn len<N: SatCountNumber, S: BuildHasher>(&self, cache: &mut SatCountCache<N, S>) -> N {
+        self.with_manager_shared(|manager, set| Self::len_edge(manager, set, cache))
     }
 
     /// Returns the number of vectors (lists) contained in the set rooted at
     /// `set`.
+    ///
+    /// Like [`sat_count_edge`][oxidd_core::function::BooleanFunction::sat_count_edge],
+    /// the count is computed in the number type `N` (for example `u128`, or
+    /// `F64` for an approximation) and the results per node are kept in
+    /// `cache`, which can be reused for other sets.
     #[inline]
-    pub fn len_edge<'id>(
+    pub fn len_edge<'id, N: SatCountNumber, S: BuildHasher>(
         manager: &<Self as Function>::Manager<'id>,
         set: Ref<'_, EdgeOfFunc<'id, Self>>,
-    ) -> usize {
-        len(manager, set, &mut HashMap::new())
+        cache: &mut SatCountCache<N, S>,
+    ) -> N {
+        // An LDD has no variables to count over, only its number of vectors
+        // matters.
+        cache.clear_if_invalid(manager, 0);
+        len(manager, set, &mut cache.map)
     }
 
     /// Returns `true` if `self` is the empty set `∅`, i.e. contains no vectors.
@@ -1620,6 +1736,54 @@ where
         self.with_manager_shared(|manager, edge| {
             manager.get_node(edge).is_terminal(&LDDTerminal::Empty)
         })
+    }
+
+    /// Returns `N*(set)`, the smallest superset of `set` closed under every
+    /// event in `events`, computed by saturation rather than whole-set
+    /// fixpoint iteration.
+    ///
+    /// > T. van Dijk, J. Meijer, J. van de Pol, *Multi-core on-the-fly
+    /// > saturation*, TACAS 2019.
+    ///
+    /// `set` must reside at `level`, and every event must have `top >= level`.
+    /// The vectors in `set` may have any length, as long as it is the same for
+    /// all of them and the events fit within it.
+    ///
+    /// Before event `e` fires on a node `node` at its `top` level, saturation
+    /// fires the relation returned by `relation(e, node)`. This allows learning
+    /// the relation on the fly, for the vectors of `node`.
+    ///
+    /// Intermediate results are memoized in the apply cache, and the key does
+    /// not contain the events. `epoch` stands in for them: every call with the
+    /// same `epoch` on a manager shares its cached results, so it must only be
+    /// reused for calls with exactly the same events, and has to be changed as
+    /// soon as the events differ, for example when a relation has grown. Using
+    /// one epoch for different events can silently give a wrong result, while
+    /// a new epoch is always correct and only gives up the reuse of earlier
+    /// results. Nothing has to be swept, since entries of other epochs never
+    /// match and are overwritten like any other entry.
+    #[inline]
+    pub fn saturate_edge<'id, Rel>(
+        manager: &<Self as Function>::Manager<'id>,
+        level: LevelNo,
+        set: Ref<'_, EdgeOfFunc<'id, Self>>,
+        events: &[SaturationEvent<Ref<'_, EdgeOfFunc<'id, Self>>>],
+        epoch: u32,
+        relation: &Rel,
+    ) -> AllocResult<OwnEdgeOfFunc<'id, Self>>
+    where
+        Rel: ?Sized
+            + Fn(usize, Ref<'_, EdgeOfFunc<'id, Self>>) -> AllocResult<OwnEdgeOfFunc<'id, Self>>,
+    {
+        crate::saturate::saturate(
+            manager,
+            SequentialRecursor,
+            level,
+            set,
+            events,
+            epoch,
+            relation,
+        )
     }
 }
 
@@ -1691,6 +1855,17 @@ pub mod mt {
             vector: &[INodeValOfFunc<'id, Self>],
         ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
             singleton(manager, vector)
+        }
+
+        /// See [`LDDFunction::union_cube_edge`]; also sequential here.
+        #[inline]
+        pub fn union_cube_edge<'id>(
+            manager: &<Self as Function>::Manager<'id>,
+            level: LevelNo,
+            set: Ref<'_, EdgeOfFunc<'id, Self>>,
+            cube: &[INodeValOfFunc<'id, Self>],
+        ) -> AllocResult<OwnEdgeOfFunc<'id, Self>> {
+            union_cube(manager, level, set, cube)
         }
 
         /// See [`LDDFunction::union`].
@@ -1855,17 +2030,19 @@ pub mod mt {
         }
 
         /// See [`LDDFunction::len`].
-        pub fn len(&self) -> usize {
-            self.with_manager_shared(|manager, set| Self::len_edge(manager, set))
+        pub fn len<N: SatCountNumber, S: BuildHasher>(&self, cache: &mut SatCountCache<N, S>) -> N {
+            self.with_manager_shared(|manager, set| Self::len_edge(manager, set, cache))
         }
 
         /// See [`LDDFunction::len_edge`].
         #[inline]
-        pub fn len_edge<'id>(
+        pub fn len_edge<'id, N: SatCountNumber, S: BuildHasher>(
             manager: &<Self as Function>::Manager<'id>,
             set: Ref<'_, EdgeOfFunc<'id, Self>>,
-        ) -> usize {
-            len(manager, set, &mut HashMap::new())
+            cache: &mut SatCountCache<N, S>,
+        ) -> N {
+            cache.clear_if_invalid(manager, 0);
+            len(manager, set, &mut cache.map)
         }
 
         /// See [`LDDFunction::is_empty`].
@@ -1873,6 +2050,42 @@ pub mod mt {
             self.with_manager_shared(|manager, edge| {
                 manager.get_node(edge).is_terminal(&LDDTerminal::Empty)
             })
+        }
+
+        /// See [`LDDFunction::saturate_edge`].
+        ///
+        /// The children of a node are saturated in parallel, and so are the
+        /// relational products and unions that fire the events. `relation` is
+        /// called from every worker, also concurrently.
+        #[inline]
+        pub fn saturate_edge<'id, Rel>(
+            manager: &<Self as Function>::Manager<'id>,
+            level: LevelNo,
+            set: Ref<'_, EdgeOfFunc<'id, Self>>,
+            events: &[SaturationEvent<Ref<'_, EdgeOfFunc<'id, Self>>>],
+            epoch: u32,
+            relation: &Rel,
+        ) -> AllocResult<OwnEdgeOfFunc<'id, Self>>
+        where
+            INodeValOfFunc<'id, Self>: Send + Sync,
+            Rel: ?Sized
+                + Fn(usize, Ref<'_, EdgeOfFunc<'id, Self>>) -> AllocResult<OwnEdgeOfFunc<'id, Self>>
+                + Sync,
+        {
+            let saturate = || {
+                crate::saturate::saturate(
+                    manager,
+                    ParallelRecursor::new(manager),
+                    level,
+                    set,
+                    events,
+                    epoch,
+                    relation,
+                )
+            };
+            // Enter the pool once, so that saturation and every call of
+            // `relation` run on the workers.
+            oxidd_core::WorkerPool::install(manager.workers(), saturate)
         }
     }
 }

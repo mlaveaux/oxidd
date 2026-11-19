@@ -10,9 +10,7 @@ use oxidd_derive::Countable;
 
 mod apply_rec;
 mod recursor;
-
-#[cfg(feature = "statistics")]
-pub use apply_rec::print_stats;
+mod saturate;
 
 /// Terminal nodes of an LDD.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Countable, Debug)]
@@ -118,6 +116,10 @@ pub enum LDDOp {
 
     RelationalSuccessors,
     RelationalPredecessors,
+
+    /// Saturation. The cache key also holds the epoch, because the result
+    /// depends on the relations.
+    Saturate,
 }
 
 trait LDDManager:
@@ -142,6 +144,20 @@ pub struct RelationMeta<E> {
     pub read_positions: Vec<LevelNo>,
     /// The positions of the write values in the relation vectors.
     pub write_positions: Vec<LevelNo>,
+}
+
+/// One event (transition group) used by [`LDDFunction::saturate_edge`].
+///
+/// `meta_at_top` is a meta-LDD as for [`LDDFunction::relational_successors`],
+/// except that it must already be descended `top` times, so that its own root
+/// describes position `top`. The meta-LDD only has `skip` entries above `top`,
+/// which saturation never needs to see. The relation of the event is provided
+/// by the `relation` closure of [`LDDFunction::saturate_edge`].
+pub struct SaturationEvent<E> {
+    /// The event's relation meta-LDD, descended `top` times.
+    pub meta_at_top: E,
+    /// First (topmost) position of the vectors that this event reads or writes.
+    pub top: LevelNo,
 }
 
 // --- Function Interface ------------------------------------------------------
@@ -211,28 +227,28 @@ macro_rules! stat {
     (call $op:expr) => {
         let _ = $op as usize;
         #[cfg(feature = "statistics")]
-        STAT_COUNTERS[$op as usize]
+        $crate::STAT_COUNTERS[$op as usize]
             .calls
             .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
     };
     (cache_query $op:expr) => {
         let _ = $op as usize;
         #[cfg(feature = "statistics")]
-        STAT_COUNTERS[$op as usize]
+        $crate::STAT_COUNTERS[$op as usize]
             .cache_queries
             .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
     };
     (cache_hit $op:expr) => {
         let _ = $op as usize;
         #[cfg(feature = "statistics")]
-        STAT_COUNTERS[$op as usize]
+        $crate::STAT_COUNTERS[$op as usize]
             .cache_hits
             .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
     };
     (reduced $op:expr) => {
         let _ = $op as usize;
         #[cfg(feature = "statistics")]
-        STAT_COUNTERS[$op as usize]
+        $crate::STAT_COUNTERS[$op as usize]
             .reduced
             .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
     };
